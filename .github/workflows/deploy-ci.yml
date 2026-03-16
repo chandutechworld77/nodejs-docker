@@ -6,7 +6,7 @@ on:
       - master
       - main
       - dev
-  workflow_dispatch:
+  workflow_dispatch :
 
 env:
   APP_PORT: 8080
