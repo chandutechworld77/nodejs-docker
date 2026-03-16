@@ -3,9 +3,8 @@ name: faang-devsecops-pipeline
 on:
   push:
     branches:
-      - main
-      - dev
-      - release/*
+      - master
+      
   workflow_dispatch:
 
 env:
