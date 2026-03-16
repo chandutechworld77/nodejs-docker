@@ -18,6 +18,7 @@ env:
   RETRY_DELAY: 5
   SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
   DOCKER_BUILDKIT: 1
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   # ========== STAGE 1: INITIAL BUILD ==========
@@ -29,12 +30,12 @@ jobs:
       build_logs: ${{ steps.capture_logs.outputs.logs }}
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.1
         with:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v4.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
@@ -112,10 +113,10 @@ jobs:
       vulnerabilities: ${{ steps.vuln_summary.outputs.summary }}
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v4.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
@@ -132,7 +133,7 @@ jobs:
 
       - name: Trivy Container Image Scan
         id: trivy_scan
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@0.24.0
         continue-on-error: true
         with:
           scan-type: 'fs'
@@ -143,7 +144,7 @@ jobs:
 
       - name: Upload Trivy Results to GitHub Security
         if: always()
-        uses: github/codeql-action/upload-sarif@v2
+        uses: github/codeql-action/upload-sarif@v3
         continue-on-error: true
         with:
           sarif_file: 'trivy-results.sarif'
@@ -199,7 +200,7 @@ jobs:
 
       - name: Upload Security Reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.4.0
         with:
           name: security-reports
           path: |
@@ -222,10 +223,10 @@ jobs:
       coverage: ${{ steps.coverage.outputs.percentage }}
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.1
 
       - name: Setup Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v4.1.0
         with:
           node-version: ${{ matrix.node-version }}
           cache: 'npm'
@@ -274,7 +275,7 @@ jobs:
 
       - name: Upload Test Results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.4.0
         with:
           name: test-results-node-${{ matrix.node-version }}-${{ matrix.test-suite }}
           path: |
@@ -291,10 +292,10 @@ jobs:
       perf_status: ${{ job.status }}
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v4.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
@@ -319,7 +320,6 @@ jobs:
         run: |
           echo "⚡ Running K6 load tests..."
           
-          # Create load test script if not exists
           if [ ! -f load-test.js ]; then
             cat > load-test.js << 'LOADTEST'
           import http from 'k6/http';
@@ -381,7 +381,7 @@ jobs:
 
       - name: Upload Performance Results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.4.0
         with:
           name: performance-test-results
           path: |
@@ -400,10 +400,10 @@ jobs:
       suggested_fix: ${{ steps.ai_analysis.outputs.fix }}
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.1
 
       - name: Download All Test Logs
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4.4.0
         continue-on-error: true
 
       - name: AI-Powered Log Analysis with Pattern Matching
@@ -414,7 +414,6 @@ jobs:
           ANALYSIS_RESULT="success"
           SUGGESTED_FIX=""
           
-          # Analyze common failure patterns from all logs
           for log_file in */test-output*.log security-reports/security-report.md resource-analysis.md; do
             if [ -f "$log_file" ]; then
               echo "Analyzing: $log_file"
@@ -485,7 +484,7 @@ jobs:
 
       - name: Upload Analysis Reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.4.0
         with:
           name: ai-analysis-reports
           path: failure-analysis-report.md
@@ -499,12 +498,12 @@ jobs:
     if: always()
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v4.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
@@ -515,10 +514,7 @@ jobs:
         run: |
           echo "🔐 Attempting automatic security vulnerability fixes..."
           
-          # Fix security vulnerabilities
           npm audit fix --audit-level=moderate --force || true
-          
-          # Update package locks
           npm install --package-lock-only || true
           
           if git diff --quiet package*.json; then
@@ -534,13 +530,8 @@ jobs:
         continue-on-error: true
         run: |
           echo "🔧 Running automatic code formatting and linting fixes..."
-          
-          # Run prettier
           npx prettier --write . --ignore-unknown || true
-          
-          # Run eslint with fix
           npx eslint . --fix || true
-          
           echo "✅ Code formatting completed"
 
       - name: Auto-Fix Performance Issues
@@ -607,7 +598,7 @@ jobs:
 
       - name: Create Pull Request for Remaining Issues
         if: failure()
-        uses: actions/github-script@v7
+        uses: actions/github-script@v7.0.1
         continue-on-error: true
         with:
           script: |
@@ -669,7 +660,7 @@ jobs:
 
       - name: Create Issue for Manual Review
         if: failure()
-        uses: actions/github-script@v7
+        uses: actions/github-script@v7.0.1
         continue-on-error: true
         with:
           script: |
@@ -720,7 +711,7 @@ jobs:
 
       - name: Upload Auto-Fix Artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.4.0
         with:
           name: auto-fix-artifacts
           path: |
@@ -739,13 +730,13 @@ jobs:
       canary_status: ${{ job.status }}
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+        uses: docker/setup-buildx-action@v3.6.1
 
       - name: Log in to Container Registry
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3.3.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -753,7 +744,7 @@ jobs:
 
       - name: Extract Metadata
         id: meta
-        uses: docker/metadata-action@v4
+        uses: docker/metadata-action@v5.6.1
         with:
           images: ${{ env.REGISTRY }}/${{ github.repository }}
           tags: |
@@ -764,7 +755,7 @@ jobs:
 
       - name: Build Docker Image
         id: docker_build
-        uses: docker/build-push-action@v4
+        uses: docker/build-push-action@v6.5.0
         with:
           context: .
           push: true
@@ -813,7 +804,6 @@ jobs:
           echo "📊 Monitoring canary deployment metrics..."
           sleep 30
           
-          # Simulate metric collection
           echo "Error Rate: 0.05%"
           echo "Response Time (p99): 850ms"
           echo "Status: ✅ HEALTHY"
@@ -863,7 +853,7 @@ jobs:
 
       - name: Upload Canary Deployment Reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.4.0
         with:
           name: canary-deployment-reports
           path: |
@@ -879,10 +869,10 @@ jobs:
     if: always()
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.1
 
       - name: Download All Artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4.4.0
         continue-on-error: true
 
       - name: Collect Pipeline Metrics
@@ -1041,7 +1031,6 @@ jobs:
         run: |
           echo "⚠️ Checking alert thresholds..."
           
-          # Alert thresholds
           SUCCESS_RATE_THRESHOLD=95
           COVERAGE_THRESHOLD=80
           VULN_THRESHOLD=0
@@ -1070,7 +1059,7 @@ jobs:
 
       - name: Upload Observability Reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.4.0
         with:
           name: observability-reports
           path: |
@@ -1087,16 +1076,16 @@ jobs:
     if: always()
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v4.1.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
 
       - name: Download All Test Artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4.4.0
         continue-on-error: true
 
       - name: Run Final Comprehensive Tests
@@ -1354,7 +1343,7 @@ jobs:
 
       - name: Upload Final Reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.4.0
         with:
           name: enterprise-final-reports
           path: |
@@ -1363,7 +1352,7 @@ jobs:
           retention-days: 90
 
       - name: Post GitHub Status Check
-        uses: actions/github-script@v7
+        uses: actions/github-script@v7.0.1
         with:
           script: |
             const buildStatus = '${{ needs.build.outputs.build_status }}';
@@ -1439,8 +1428,8 @@ jobs:
             echo "emoji=⚠️"
           fi >> $GITHUB_OUTPUT
 
-      - name: Send Slack Notification
-        if: always()
+      - name: Slack Notification (Optional)
+        if: always() && env.SLACK_WEBHOOK_URL
         continue-on-error: true
         uses: slackapi/slack-github-action@v1.24.0
         env:
@@ -1509,7 +1498,7 @@ jobs:
 
       - name: Create GitHub Release (on master)
         if: github.ref == 'refs/heads/master' && success()
-        uses: actions/github-script@v7
+        uses: actions/github-script@v7.0.1
         continue-on-error: true
         with:
           script: |
@@ -1551,3 +1540,11 @@ jobs:
             } catch (error) {
               console.log('Release creation skipped:', error.message);
             }
+
+      - name: Pipeline Completion Summary
+        run: |
+          echo "✅ Pipeline execution completed"
+          echo "Pipeline Run: #${{ github.run_number }}"
+          echo "Status: ${{ steps.final_status.outputs.status }}"
+          echo ""
+          echo "All artifacts are available in GitHub Actions artifacts section"
