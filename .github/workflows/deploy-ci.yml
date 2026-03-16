@@ -1,125 +1,250 @@
----
-pipeline_security_addons:
-  name: 🛡️ Pipeline Security & Optimization
-  runs-on: ubuntu-latest
-  needs:
-    - build
-    - deploy
-    - validate
-    - notifications
-  if: always()
-  steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-    - name: Auto Fix Code Indentation
-      run: >
-        echo "🔧 Fixing code indentation and formatting..."
+name: project-dev-deploy
+
+on:
+  push:
+    branches: ["master"]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  security-events: write
+
+concurrency:
+  group: aca-dev-${{ github.repository }}
+  cancel-in-progress: true
+
+env:
+  ACR_NAME: ${{ vars.ACR_NAME }}
+  RG_SHARED: ${{ vars.RG_SHARED }}
+  RG_ENV: ${{ vars.RG_ENV }}
+  ACR_REPO: ${{ vars.ACR_REPO }}
+
+  APP_NAME: ${{ vars.APP_NAME }}
+  CAE_ENV: ${{ vars.CAE_ENV }}
+
+  INGRESS_TYPE: external
+  APP_PORT: 8080
+
+  MIN_REPLICAS: 1
+  MAX_REPLICAS: 2
+
+  HEALTH_RETRIES: 6
+  HEALTH_WAIT: 30
 
 
-        sudo apt-get update
+jobs:
 
-        sudo apt-get install -y clang-format
+# ==========================================================
+# BUILD + SECURITY SCAN
+# ==========================================================
+  build:
 
+    name: Build & Security Scan
+    runs-on: ubuntu-latest
 
-        find . -type f \( -name "*.js" -o -name "*.ts" -o -name "*.py" -o -name "*.java" -o -name "*.go" \) | while read file; do
-          echo "Formatting $file"
-          clang-format -i "$file" || true
-        done
+    outputs:
+      IMAGE: ${{ steps.image.outputs.IMAGE }}
+      LOGIN_SERVER: ${{ steps.acr.outputs.LOGIN_SERVER }}
+      TAG: ${{ steps.meta.outputs.TAG }}
 
+    steps:
 
-        echo "✅ Formatting completed"
-    - name: Detect Pipeline Risks
-      run: >
-        echo "🔍 Checking pipeline risks..."
+      - name: Clean workspace
+        run: |
+          rm -rf * .[^.]* || true
+          df -h
 
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-        if [ ! -f Dockerfile ]; then
-          echo "❌ Dockerfile missing"
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Generate image metadata
+        id: meta
+        run: |
+          echo "TAG=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - name: Get ACR login server
+        id: acr
+        run: |
+          LOGIN_SERVER=$(az acr show \
+            -g "${{ env.RG_SHARED }}" \
+            -n "${{ env.ACR_NAME }}" \
+            --query loginServer -o tsv)
+
+          echo "LOGIN_SERVER=$LOGIN_SERVER" >> $GITHUB_OUTPUT
+
+      - name: Define Image
+        id: image
+        run: |
+          IMAGE="${{ steps.acr.outputs.LOGIN_SERVER }}/${{ env.ACR_REPO }}:${{ steps.meta.outputs.TAG }}"
+          echo "IMAGE=$IMAGE" >> $GITHUB_OUTPUT
+
+      - name: ACR Login
+        run: az acr login -n "${{ env.ACR_NAME }}"
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          push: false
+          tags: ${{ steps.image.outputs.IMAGE }}
+
+      - name: Security Scan (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.image.outputs.IMAGE }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+      - name: Upload scan results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Push image to ACR
+        run: |
+          docker push ${{ steps.image.outputs.IMAGE }}
+
+# ==========================================================
+# DEPLOY
+# ==========================================================
+  deploy:
+
+    name: Deploy to Azure Container Apps
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Ensure Container App exists
+        run: |
+
+          if az containerapp show \
+            -g "${{ env.RG_ENV }}" \
+            -n "${{ env.APP_NAME }}" >/dev/null 2>&1
+          then
+            echo "App exists"
+          else
+
+            az containerapp create \
+              -g "${{ env.RG_ENV }}" \
+              -n "${{ env.APP_NAME }}" \
+              --environment "${{ env.CAE_ENV }}" \
+              --image mcr.microsoft.com/azuredocs/containerapps-helloworld:latest \
+              --target-port ${{ env.APP_PORT }} \
+              --ingress ${{ env.INGRESS_TYPE }} \
+              --min-replicas ${{ env.MIN_REPLICAS }} \
+              --max-replicas ${{ env.MAX_REPLICAS }} \
+              --system-assigned
+          fi
+
+      - name: Configure ACR registry access
+        run: |
+          az containerapp registry set \
+            -g "${{ env.RG_ENV }}" \
+            -n "${{ env.APP_NAME }}" \
+            --server "${{ needs.build.outputs.LOGIN_SERVER }}" \
+            --identity system
+
+      - name: Deploy new image
+        run: |
+
+          az containerapp update \
+            -g "${{ env.RG_ENV }}" \
+            -n "${{ env.APP_NAME }}" \
+            --image "${{ needs.build.outputs.IMAGE }}"
+
+# ==========================================================
+# VALIDATION
+# ==========================================================
+  validate:
+
+    name: Post Deployment Validation
+    runs-on: ubuntu-latest
+    needs: deploy
+
+    steps:
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get application URL
+        id: url
+        run: |
+
+          URL=$(az containerapp show \
+            -g "${{ env.RG_ENV }}" \
+            -n "${{ env.APP_NAME }}" \
+            --query properties.configuration.ingress.fqdn \
+            -o tsv)
+
+          echo "URL=$URL" >> $GITHUB_OUTPUT
+
+      - name: Health Check
+        run: |
+
+          URL=${{ steps.url.outputs.URL }}
+
+          for i in {1..6}
+          do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://$URL || echo 000)
+
+            if [ "$STATUS" == "200" ]
+            then
+              echo "Application healthy"
+              exit 0
+            fi
+
+            sleep 20
+          done
+
+          echo "Health check failed"
           exit 1
-        fi
 
+# ==========================================================
+# NOTIFICATION
+# ==========================================================
+  notify:
 
-        if [ ! -f package.json ] && [ ! -f requirements.txt ] && [ ! -f pom.xml ]; then
-          echo "⚠️ Dependency manifest not detected"
-        fi
+    name: Deployment Notification
+    runs-on: ubuntu-latest
+    needs: [build, deploy, validate]
+    if: always()
 
+    steps:
 
-        echo "✅ Pipeline validation completed"
-    - name: Malware Scan
-      run: |
-        echo "🦠 Running malware scan..."
+      - name: Deployment Summary
+        run: |
 
-        sudo apt-get update
-        sudo apt-get install -y clamav
-
-        sudo freshclam
-
-        clamscan -r . --infected --remove=no
-
-        echo "✅ Malware scan completed"
-    - name: Verify Pipeline Actor
-      run: |
-        echo "🔐 Checking pipeline actor..."
-
-        ACTOR="${{ github.actor }}"
-        echo "Triggered by: $ACTOR"
-
-        if [ -z "$ACTOR" ]; then
-          echo "⚠️ Unknown pipeline actor"
-        else
-          echo "✅ Actor verification completed"
-        fi
-    - name: Optimize Runner Performance
-      run: |
-        echo "⚡ Optimizing runner performance..."
-
-        sudo sysctl -w net.core.somaxconn=1024
-        sudo sysctl -w vm.swappiness=10
-
-        echo "✅ Runner optimization applied"
-    - name: Predict Pipeline Outcome
-      run: |
-        echo "📊 Predicting pipeline outcome..."
-
-        if [ "${{ needs.deploy.result }}" == "success" ]; then
-          echo "Prediction: Deployment likely SUCCESS"
-        else
-          echo "Prediction: Deployment may require investigation"
-        fi
-    - name: Cleanup Pipeline Junk
-      run: |
-        echo "🧹 Cleaning pipeline environment..."
-
-        docker system prune -af || true
-        rm -rf /tmp/* || true
-        rm -rf ~/.cache || true
-
-        echo "✅ Cleanup completed"
-    - name: Harden Runner Security
-      run: |
-        echo "🛡️ Applying runner security hardening..."
-
-        sudo ufw default deny incoming
-        sudo ufw default allow outgoing
-
-        echo "✅ Runner hardened"
-    - name: Pipeline Add-on Summary
-      run: |
-        cat << 'EOF'
-
-        ╔════════════════════════════════════════════════════════╗
-        ║       🛡️ PIPELINE SECURITY ADDONS COMPLETED            ║
-        ╚════════════════════════════════════════════════════════╝
-
-        ✔ Code formatting auto-fix executed
-        ✔ Pipeline risk detection completed
-        ✔ Malware scanning completed
-        ✔ Pipeline actor verification completed
-        ✔ Runner performance optimized
-        ✔ Pipeline outcome prediction generated
-        ✔ Pipeline environment cleaned
-        ✔ Runner security hardened
-
-        Pipeline successfully enhanced with DevSecOps safeguards.
-
-        EOF
+          echo "===================================="
+          echo "DEPLOYMENT PIPELINE FINISHED"
+          echo "Repository: ${{ github.repository }}"
+          echo "Image: ${{ needs.build.outputs.IMAGE }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Run: ${{ github.run_id }}"
+          echo "===================================="
