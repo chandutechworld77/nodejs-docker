@@ -200,7 +200,7 @@ jobs:
 
       - name: Upload Security Reports
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: security-reports
           path: |
@@ -275,7 +275,7 @@ jobs:
 
       - name: Upload Test Results
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: test-results-node-${{ matrix.node-version }}-${{ matrix.test-suite }}
           path: |
@@ -381,7 +381,7 @@ jobs:
 
       - name: Upload Performance Results
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: performance-test-results
           path: |
@@ -445,7 +445,7 @@ jobs:
 
       - name: Upload Analysis Reports
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ai-analysis-reports
           path: failure-analysis-report.md
@@ -553,7 +553,7 @@ jobs:
 
       - name: Upload Auto-Fix Artifacts
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: auto-fix-artifacts
           path: |
@@ -685,7 +685,7 @@ jobs:
 
       - name: Upload Canary Deployment Reports
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: canary-deployment-reports
           path: |
@@ -837,7 +837,7 @@ jobs:
 
       - name: Upload Observability Reports
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: observability-reports
           path: |
@@ -956,7 +956,7 @@ jobs:
 
       - name: Upload Final Reports
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: enterprise-final-reports
           path: enterprise-pipeline-summary.md
@@ -998,6 +998,14 @@ jobs:
           ║  📊 Pipeline Health: EXCELLENT (98.4%)                         ║
           ║  ⏱️  Total Duration: ~15 minutes                               ║
           ║  🚀 Deployment: LIVE to 100% users                             ║
+          ║                                                                ║
+          ║  Reports Available in Artifacts:                               ║
+          ║  • enterprise-final-reports                                    ║
+          ║  • security-reports                                            ║
+          ║  • test-results-*                                              ║
+          ║  • performance-test-results                                    ║
+          ║  • observability-reports                                       ║
+          ║  • canary-deployment-reports                                   ║
           ║                                                                ║
           ╚════════════════════════════════════════════════════════════════╝
           
