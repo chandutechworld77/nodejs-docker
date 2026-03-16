@@ -22,13 +22,17 @@ jobs:
       - name: Record start time
         id: start
         run: echo "time=$(date +%s)" >> $GITHUB_OUTPUT
+
       - name: Clean workspace
         run: |
           docker system prune -af || true
           rm -rf *
+
       - name: Generate report
         run: echo "Workspace cleaned successfully" > cleanup-report.txt
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload cleanup report
+        uses: actions/upload-artifact@v4
         with:
           name: cleanup-report
           path: cleanup-report.txt
@@ -44,7 +48,9 @@ jobs:
           if [[ ! " $ALLOWED_BRANCHES " =~ " $BRANCH " ]]; then
             echo "Unauthorized branch execution" >> branch-report.txt
             exit 1
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload branch report
+        uses: actions/upload-artifact@v4
         with:
           name: branch-report
           path: branch-report.txt
@@ -54,11 +60,14 @@ jobs:
     needs: branch_guard
     steps:
       - uses: actions/checkout@v4
+
       - name: Fix YAML indentation
         run: |
           npm install -g prettier
           prettier --write "**/*.yml" > formatting-report.txt || true
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload formatting report
+        uses: actions/upload-artifact@v4
         with:
           name: formatting-report
           path: formatting-report.txt
@@ -68,10 +77,13 @@ jobs:
     needs: formatting
     steps:
       - uses: actions/checkout@v4
+
       - name: Run vulnerability scan
         run: |
           docker run --rm -v $(pwd):/src aquasec/trivy fs /src > dependency-scan-report.txt
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload dependency scan report
+        uses: actions/upload-artifact@v4
         with:
           name: dependency-scan-report
           path: dependency-scan-report.txt
@@ -81,19 +93,25 @@ jobs:
     needs: dependency_scan
     steps:
       - uses: actions/checkout@v4
+
       - name: Install ClamAV
         run: |
           sudo apt-get update
           sudo apt-get install -y clamav clamav-daemon
+
       - name: Stop background services
         run: |
           sudo systemctl stop clamav-freshclam || true
           sudo systemctl stop clamav-daemon || true
+
       - name: Update virus database
         run: sudo freshclam --stdout
+
       - name: Run malware scan
         run: clamscan -r . --infected --log=malware-report.txt || true
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload malware report
+        uses: actions/upload-artifact@v4
         with:
           name: malware-report
           path: malware-report.txt
@@ -103,25 +121,32 @@ jobs:
     needs: malware_scan
     steps:
       - uses: actions/checkout@v4
+
       - name: Build Docker image
         run: docker build -t devsecops-app . > build-report.txt
+
       - name: Run container
         run: |
           docker run -d -p 8080:8080 --name test-container devsecops-app
           sleep 15
+
       - name: Container logs
         run: docker logs test-container > container-test-report.txt || true
+
       - name: Health check
         run: |
           for i in {1..10}; do
             curl -f http://localhost:8080 && break
             sleep 5
           done
+
       - name: Stop container
         run: |
           docker stop test-container
           docker rm test-container
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload container test report
+        uses: actions/upload-artifact@v4
         with:
           name: container-test-report
           path: container-test-report.txt
@@ -132,7 +157,9 @@ jobs:
     steps:
       - name: Scan container
         run: docker run --rm aquasec/trivy image devsecops-app > container-scan-report.txt
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload container scan report
+        uses: actions/upload-artifact@v4
         with:
           name: container-scan-report
           path: container-scan-report.txt
@@ -146,7 +173,9 @@ jobs:
           echo "Cost Analysis" > cost-report.txt
           echo "Use autoscaling" >> cost-report.txt
           echo "Reduce replicas if CPU <50%" >> cost-report.txt
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload cost report
+        uses: actions/upload-artifact@v4
         with:
           name: cost-report
           path: cost-report.txt
@@ -157,7 +186,9 @@ jobs:
     steps:
       - name: Predict pipeline success
         run: echo "Prediction: deployment likely successful" > prediction-report.txt
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload prediction report
+        uses: actions/upload-artifact@v4
         with:
           name: prediction-report
           path: prediction-report.txt
@@ -170,7 +201,9 @@ jobs:
     steps:
       - name: Await approval
         run: echo "Waiting for manual approval" > approval-report.txt
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload approval report
+        uses: actions/upload-artifact@v4
         with:
           name: approval-report
           path: approval-report.txt
@@ -181,7 +214,9 @@ jobs:
     steps:
       - name: Deployment stage
         run: echo "Application deployed" > deployment-report.txt
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload deployment report
+        uses: actions/upload-artifact@v4
         with:
           name: deployment-report
           path: deployment-report.txt
@@ -192,7 +227,9 @@ jobs:
     steps:
       - name: Calculate runtime
         run: echo "Pipeline runtime calculated" > runtime-report.txt
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload runtime report
+        uses: actions/upload-artifact@v4
         with:
           name: runtime-report
           path: runtime-report.txt
@@ -203,9 +240,12 @@ jobs:
     steps:
       - name: Clean runner
         run: docker system prune -af || true
+
       - name: Generate cleanup report
         run: echo "Cleanup completed" > final-cleanup-report.txt
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload final cleanup report
+        uses: actions/upload-artifact@v4
         with:
           name: final-cleanup-report
           path: final-cleanup-report.txt
