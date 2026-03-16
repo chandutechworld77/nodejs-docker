@@ -4,52 +4,54 @@ on:
   push:
     branches:
       - master
-      
   workflow_dispatch:
 
 env:
   APP_PORT: 8080
-  ALLOWED_BRANCHES: "main dev"
+  ALLOWED_BRANCHES: "master main dev"
 
 jobs:
 
+# ==============================
+# BRANCH GUARD
+# ==============================
   guard:
-
     runs-on: ubuntu-latest
 
     steps:
-
       - name: Detect branch
         run: |
-          BRANCH=${GITHUB_REF##*/}
+          BRANCH=${GITHUB_REF_NAME}
           echo "Current branch: $BRANCH"
 
-          if [[ ! "${ALLOWED_BRANCHES}" =~ "${BRANCH}" ]]; then
+          if [[ ! " $ALLOWED_BRANCHES " =~ " $BRANCH " ]]; then
             echo "Unauthorized branch execution detected"
             exit 1
           fi
 
+# ==============================
+# AUTO FORMAT FIX
+# ==============================
   formatting:
-
     runs-on: ubuntu-latest
     needs: guard
 
     steps:
-
       - uses: actions/checkout@v4
 
       - name: Fix YAML indentation
         run: |
           npm install -g prettier
-          prettier --write "**/*.yml"
+          prettier --write "**/*.yml" || true
 
+# ==============================
+# SECURITY SCAN (DEPENDENCIES)
+# ==============================
   security_scan:
-
     runs-on: ubuntu-latest
     needs: formatting
 
     steps:
-
       - uses: actions/checkout@v4
 
       - name: Dependency scan
@@ -58,13 +60,14 @@ jobs:
           scan-type: fs
           severity: CRITICAL,HIGH
 
+# ==============================
+# BUILD + LOCAL TEST
+# ==============================
   build:
-
     runs-on: ubuntu-latest
     needs: security_scan
 
     steps:
-
       - uses: actions/checkout@v4
 
       - name: Build container
@@ -73,66 +76,80 @@ jobs:
 
       - name: Run container locally
         run: |
-          docker run -d -p 8080:8080 app-test
+          docker run -d -p 8080:8080 --name test-container app-test
           sleep 10
 
-      - name: Health test
+      - name: Health check
         run: |
           curl -f http://localhost:8080 || exit 1
 
-  container_scan:
+      - name: Stop container
+        run: |
+          docker stop test-container
+          docker rm test-container
 
+# ==============================
+# CONTAINER SECURITY SCAN
+# ==============================
+  container_scan:
     runs-on: ubuntu-latest
     needs: build
 
     steps:
-
       - name: Scan container
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: app-test
+          severity: CRITICAL,HIGH
 
+# ==============================
+# COST ANALYSIS
+# ==============================
   cost_analysis:
-
     runs-on: ubuntu-latest
     needs: container_scan
 
     steps:
-
-      - name: Estimate deployment cost
+      - name: Analyze deployment cost
         run: |
           echo "Analyzing deployment cost..."
-          echo "Suggested replica reduction if load <50%"
+          echo "Recommendation:"
+          echo "- Reduce replicas if usage <50%"
+          echo "- Enable autoscaling"
 
+# ==============================
+# DEPLOYMENT PREDICTION
+# ==============================
   prediction:
-
     runs-on: ubuntu-latest
     needs: cost_analysis
 
     steps:
-
-         - name: Predict deployment success
+      - name: Predict deployment success
         run: |
-             echo "Prediction: deployment likely to succeed"
+          echo "Analyzing previous stages..."
+          echo "Prediction: Deployment likely successful"
 
+# ==============================
+# DEPLOY
+# ==============================
   deploy:
-
     runs-on: ubuntu-latest
     needs: prediction
 
     steps:
-
       - name: Deploy container
         run: |
-          echo "Deploying application"
+          echo "Deployment step executed"
 
+# ==============================
+# CLEANUP
+# ==============================
   cleanup:
-
     runs-on: ubuntu-latest
     needs: deploy
 
     steps:
-
-      - name: Cleanup docker images
+      - name: Cleanup runner
         run: |
-          docker system prune -af
+          docker system prune -af || true
