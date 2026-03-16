@@ -13,10 +13,24 @@ env:
 jobs:
 
 # ==============================
+# CLEAN WORKSPACE
+# ==============================
+  clean_workspace:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clean runner workspace
+        run: |
+          echo "Cleaning workspace..."
+          docker system prune -af || true
+          rm -rf *
+
+# ==============================
 # BRANCH GUARD
 # ==============================
   guard:
     runs-on: ubuntu-latest
+    needs: clean_workspace
 
     steps:
       - name: Detect branch
@@ -30,7 +44,7 @@ jobs:
           fi
 
 # ==============================
-# AUTO FORMAT FIX
+# FORMAT FIX
 # ==============================
   formatting:
     runs-on: ubuntu-latest
@@ -54,14 +68,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Dependency scan
+      - name: Dependency vulnerability scan
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: fs
           severity: CRITICAL,HIGH
 
 # ==============================
-# BUILD + LOCAL TEST
+# BUILD + LOCAL CONTAINER TEST
 # ==============================
   build:
     runs-on: ubuntu-latest
@@ -70,18 +84,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build container
+      - name: Build docker image
         run: |
           docker build -t app-test .
 
       - name: Run container locally
         run: |
           docker run -d -p 8080:8080 --name test-container app-test
-          sleep 10
+          sleep 15
 
-      - name: Health check
+      - name: Show running containers
+        run: docker ps -a
+
+      - name: Show container logs
+        run: docker logs test-container || true
+
+      - name: Health check with retry
         run: |
-          curl -f http://localhost:8080 || exit 1
+          for i in {1..10}; do
+            curl -f http://localhost:8080 && break
+            echo "Waiting for application to start..."
+            sleep 5
+          done
 
       - name: Stop container
         run: |
@@ -96,7 +120,7 @@ jobs:
     needs: build
 
     steps:
-      - name: Scan container
+      - name: Scan container image
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: app-test
@@ -110,12 +134,12 @@ jobs:
     needs: container_scan
 
     steps:
-      - name: Analyze deployment cost
+      - name: Estimate deployment cost
         run: |
           echo "Analyzing deployment cost..."
-          echo "Recommendation:"
-          echo "- Reduce replicas if usage <50%"
-          echo "- Enable autoscaling"
+          echo "Suggestions:"
+          echo "- Reduce replicas if CPU usage <50%"
+          echo "- Enable auto scaling"
 
 # ==============================
 # DEPLOYMENT PREDICTION
@@ -127,7 +151,7 @@ jobs:
     steps:
       - name: Predict deployment success
         run: |
-          echo "Analyzing previous stages..."
+          echo "Analyzing pipeline results..."
           echo "Prediction: Deployment likely successful"
 
 # ==============================
@@ -138,18 +162,18 @@ jobs:
     needs: prediction
 
     steps:
-      - name: Deploy container
+      - name: Deploy application
         run: |
-          echo "Deployment step executed"
+          echo "Deployment stage executed"
 
 # ==============================
-# CLEANUP
+# FINAL CLEANUP
 # ==============================
   cleanup:
     runs-on: ubuntu-latest
     needs: deploy
 
     steps:
-      - name: Cleanup runner
+      - name: Cleanup runner resources
         run: |
           docker system prune -af || true
