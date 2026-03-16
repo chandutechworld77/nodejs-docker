@@ -1,82 +1,65 @@
-name: Production Deploy (ACA)
+name: dev-deploy (ACA)
 
 on:
   push:
-    branches:
-      - main
-      - production
-      - master
-    paths:
-      - 'src/**'
-      - 'Dockerfile'
-      - '.github/workflows/prod-deploy.yml'
-  pull_request:
-    branches:
-      - main
-      - production
-      - master
-    types:
-      - opened
-      - synchronize
-      - reopened
+    branches: ["dev"]
   workflow_dispatch:
-    inputs:
-      environment:
-        description: 'Deployment environment'
-        required: true
-        default: 'production'
-        type: choice
-        options:
-          - production
-          - staging
 
 permissions:
   id-token: write
   contents: read
   security-events: write
-  pull-requests: write
 
 concurrency:
-  group: aca-prod-${{ github.repository }}-${{ github.ref }}
-  cancel-in-progress: false
+  group: aca-dev-${{ github.repository }}
+  cancel-in-progress: true
 
 env:
-  REGISTRY_NAME: ${{ vars.ACR_NAME }}
-  RESOURCE_GROUP: ${{ vars.RG_ENV }}
-  CONTAINER_APP_NAME: ${{ vars.APP_NAME }}
-  CONTAINER_APP_ENV: ${{ vars.CAE_ENV }}
+  ACR_NAME: ${{ vars.ACR_NAME }}
+  RG_SHARED: ${{ vars.RG_SHARED }}
+  RG_ENV: ${{ vars.RG_ENV }}
   ACR_REPO: ${{ vars.ACR_REPO }}
-  MIN_REPLICAS: 2
-  MAX_REPLICAS: 5
-  HEALTH_CHECK_TIMEOUT: 300
-  HEALTH_CHECK_RETRIES: 10
+  APP_NAME: ${{ vars.APP_NAME }}
+  CAE_ENV: ${{ vars.CAE_ENV }}
+  INGRESS_TYPE: ${{ vars.INGRESS_TYPE }}
+  APP_PORT: ${{ vars.APP_PORT }}
+  MIN_REPLICAS: 1
+  MAX_REPLICAS: 2
+  HEALTH_CHECK_TIMEOUT: 180
+  HEALTH_CHECK_RETRIES: 6
 
 jobs:
 
-  # ========== STAGE 1: SECURE BUILD & SECURITY SCANNING ==========
+  # ============================
+  # BUILD + SCAN + PUSH
+  # ============================
   build:
-    name: 🏗️ Build, Scan & Secure
+    name: 🏗️ Build, Scan & Push
     runs-on: ubuntu-latest
-    environment: production
-    
+    environment: dev
+
     outputs:
       IMAGE: ${{ steps.img.outputs.IMAGE }}
       LOGIN_SERVER: ${{ steps.acr.outputs.LOGIN_SERVER }}
-      IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
-      SBOM_HASH: ${{ steps.sbom.outputs.sbom_hash }}
+      IMAGE_TAG: ${{ steps.meta.outputs.TAG }}
       SCAN_STATUS: ${{ steps.security.outputs.scan_status }}
       BUILD_TIMESTAMP: ${{ steps.meta.outputs.BUILD_TIMESTAMP }}
 
     steps:
 
-      # -------- Workspace Setup --------
+      # ----------------------------
+      # Clean workspace
+      # ----------------------------
       - name: Clean workspace
         run: |
           echo "🧹 Cleaning workspace..."
           rm -rf * .[^.]* || true
           df -h
 
-      - name: Checkout code
+      # ----------------------------
+      # Checkout
+      # ----------------------------
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -86,33 +69,32 @@ jobs:
         run: |
           echo "📋 Pipeline Trigger Details:"
           echo "  Event: ${{ github.event_name }}"
-          echo "  Ref: ${{ github.ref }}"
           echo "  Branch: ${{ github.ref_name }}"
           echo "  Commit: ${{ github.sha }}"
           echo "  Actor: ${{ github.actor }}"
-          echo ""
-          echo "✅ Pipeline triggered successfully!"
 
-      # -------- Azure Authentication --------
+      # ----------------------------
+      # Azure Login (OIDC)
+      # ----------------------------
       - name: Azure Login (OIDC)
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-        env:
-          AZURE_ALLOW_MANAGED_IDENTITY_CUSTOM_ASSIGNMENT: true
 
-      # -------- Image Tagging & Metadata --------
+      # ----------------------------
+      # Image metadata
+      # ----------------------------
       - name: Generate image metadata
         id: meta
         run: |
+          echo "TAG=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
           echo "BUILD_TIMESTAMP=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
-          echo "IMAGE_TAG=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
           echo "GIT_BRANCH=${GITHUB_REF#refs/heads/}" >> $GITHUB_OUTPUT
           echo "GIT_COMMIT=$GITHUB_SHA" >> $GITHUB_OUTPUT
           echo ""
-          echo "📌 Image Metadata Generated:"
+          echo "📌 Image Metadata:"
           echo "  Tag: ${GITHUB_SHA::7}"
           echo "  Branch: ${GITHUB_REF#refs/heads/}"
           echo "  Timestamp: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
@@ -123,24 +105,24 @@ jobs:
           echo "🔍 Retrieving ACR login server..."
           
           LOGIN_SERVER=$(az acr show \
-            -g "${{ env.RESOURCE_GROUP }}" \
-            -n "${{ env.REGISTRY_NAME }}" \
+            -g "${{ env.RG_SHARED }}" \
+            -n "${{ env.ACR_NAME }}" \
             --query loginServer -o tsv 2>/dev/null || echo "")
 
           if [ -z "$LOGIN_SERVER" ]; then
             echo "❌ Failed to get ACR login server"
-            echo "   Registry: ${{ env.REGISTRY_NAME }}"
-            echo "   Resource Group: ${{ env.RESOURCE_GROUP }}"
+            echo "   Registry: ${{ env.ACR_NAME }}"
+            echo "   Resource Group: ${{ env.RG_SHARED }}"
             exit 1
           fi
 
           echo "LOGIN_SERVER=$LOGIN_SERVER" >> $GITHUB_OUTPUT
           echo "✅ ACR Login Server: $LOGIN_SERVER"
 
-      - name: Define image reference
+      - name: Define image
         id: img
         run: |
-          IMAGE="${{ steps.acr.outputs.LOGIN_SERVER }}/${{ env.ACR_REPO }}:${{ steps.meta.outputs.IMAGE_TAG }}"
+          IMAGE="${{ steps.acr.outputs.LOGIN_SERVER }}/${{ env.ACR_REPO }}:${{ steps.meta.outputs.TAG }}"
           IMAGE_LATEST="${{ steps.acr.outputs.LOGIN_SERVER }}/${{ env.ACR_REPO }}:latest"
           
           echo "IMAGE=$IMAGE" >> $GITHUB_OUTPUT
@@ -150,21 +132,26 @@ jobs:
           echo "  Versioned: $IMAGE"
           echo "  Latest: $IMAGE_LATEST"
 
-      - name: ACR login
+      # ----------------------------
+      # ACR Login
+      # ----------------------------
+      - name: ACR Login
         run: |
-          echo "🔐 Authenticating to ACR..."
-          az acr login -n "${{ env.REGISTRY_NAME }}"
+          echo "🔐 Logging into ACR..."
+          az acr login -n "${{ env.ACR_NAME }}"
           echo "✅ ACR authentication successful"
 
-      # -------- Docker Build --------
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
           version: latest
           buildkitd-flags: --allow-insecure-entitlement security.insecure
 
-      - name: Build Docker image
-        id: build
+      # ----------------------------
+      # Build image
+      # ----------------------------
+      - name: Build image
+        id: docker_build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -174,31 +161,32 @@ jobs:
           tags: |
             ${{ steps.img.outputs.IMAGE }}
             ${{ steps.img.outputs.IMAGE_LATEST }}
-          cache-from: type=gha,scope=prod
-          cache-to: type=gha,mode=max,scope=prod
-          outputs: type=docker
+          cache-from: type=gha,scope=dev
+          cache-to: type=gha,mode=max,scope=dev
           build-args: |
             BUILD_DATE=${{ steps.meta.outputs.BUILD_TIMESTAMP }}
             VCS_REF=${{ steps.meta.outputs.GIT_COMMIT }}
-            VERSION=${{ steps.meta.outputs.IMAGE_TAG }}
+            VERSION=${{ steps.meta.outputs.TAG }}
           labels: |
             org.opencontainers.image.created=${{ steps.meta.outputs.BUILD_TIMESTAMP }}
             org.opencontainers.image.revision=${{ steps.meta.outputs.GIT_COMMIT }}
-            org.opencontainers.image.version=${{ steps.meta.outputs.IMAGE_TAG }}
-            org.opencontainers.image.source=${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.TAG }}
 
       - name: Display build status
         run: |
           echo "✅ Docker image built successfully"
           echo "   Image: ${{ steps.img.outputs.IMAGE }}"
 
-      # -------- Security Scanning --------
-      - name: Run Trivy vulnerability scan
+      # ----------------------------
+      # Trivy Scan
+      # ----------------------------
+      - name: Trivy Scan Image
         id: trivy
         uses: aquasecurity/trivy-action@master
         continue-on-error: true
         with:
           image-ref: ${{ steps.img.outputs.IMAGE }}
+          scanners: vuln
           format: 'sarif'
           output: 'trivy-results.sarif'
           severity: 'CRITICAL,HIGH'
@@ -206,13 +194,12 @@ jobs:
           ignore-unfixed: true
           exit-code: '0'
 
-      - name: Display Trivy scan results
+      - name: Display Trivy Report
         if: always()
         run: |
-          echo "========== 🔐 TRIVY VULNERABILITY SCAN =========="
-          
+          echo "========== TRIVY IMAGE SCAN REPORT =========="
           if [ -f trivy-results.sarif ]; then
-            echo "✅ Trivy SARIF report generated"
+            echo "✅ Trivy scan completed"
             VULN_COUNT=$(jq '.runs[0].results | length' trivy-results.sarif 2>/dev/null || echo "0")
             echo "   Vulnerabilities found: $VULN_COUNT"
           else
@@ -225,7 +212,7 @@ jobs:
         continue-on-error: true
         with:
           sarif_file: 'trivy-results.sarif'
-          category: 'trivy-container'
+          category: 'trivy-dev'
           wait-for-processing: true
 
       - name: Evaluate security scan
@@ -245,84 +232,29 @@ jobs:
 
           if [ "$CRITICAL_COUNT" -gt 0 ]; then
             echo "scan_status=FAILED_CRITICAL" >> $GITHUB_OUTPUT
-            echo "❌ CRITICAL vulnerabilities detected: $CRITICAL_COUNT"
-            exit 1
-          elif [ "$HIGH_COUNT" -gt 3 ]; then
-            echo "scan_status=FAILED_HIGH" >> $GITHUB_OUTPUT
-            echo "❌ Too many HIGH vulnerabilities: $HIGH_COUNT (threshold: 3)"
+            echo "❌ CRITICAL vulnerabilities detected - blocking deployment"
             exit 1
           else
             echo "scan_status=PASSED" >> $GITHUB_OUTPUT
             echo "✅ Security scan PASSED"
           fi
 
-      # -------- SBOM Generation --------
-      - name: Generate SBOM (Software Bill of Materials)
-        id: sbom
-        uses: anchore/sbom-action@v0
-        continue-on-error: true
-        with:
-          image: ${{ steps.img.outputs.IMAGE }}
-          format: spdx-json
-          output-file: sbom.json
-
-      - name: Verify SBOM
-        if: always()
-        run: |
-          if [ -f sbom.json ]; then
-            echo "✅ SBOM generated successfully"
-            SBOM_HASH=$(sha256sum sbom.json | awk '{print $1}')
-            echo "sbom_hash=$SBOM_HASH" >> $GITHUB_OUTPUT
-            echo "   SHA256: $SBOM_HASH"
-          else
-            echo "⚠️ SBOM generation skipped"
-          fi
-
-      # -------- Observability & Metadata --------
-      - name: Generate observability metadata
-        id: observability
-        run: |
-          mkdir -p observability
-
-          cat > observability/build-info.json << 'EOF'
-          {
-            "pipeline_version": "2.0",
-            "repository": "${{ github.repository }}",
-            "commit_sha": "${{ steps.meta.outputs.GIT_COMMIT }}",
-            "commit_branch": "${{ steps.meta.outputs.GIT_BRANCH }}",
-            "commit_author": "${{ github.actor }}",
-            "image_name": "${{ steps.img.outputs.IMAGE }}",
-            "image_tag": "${{ steps.meta.outputs.IMAGE_TAG }}",
-            "build_timestamp": "${{ steps.meta.outputs.BUILD_TIMESTAMP }}",
-            "security_scan_status": "${{ steps.security.outputs.scan_status }}",
-            "critical_vulnerabilities": ${{ steps.security.outputs.CRITICAL_VULNS }},
-            "high_vulnerabilities": ${{ steps.security.outputs.HIGH_VULNS }},
-            "sbom_generated": true,
-            "deployment_environment": "production",
-            "container_app_name": "${{ env.CONTAINER_APP_NAME }}",
-            "acr_name": "${{ env.REGISTRY_NAME }}",
-            "min_replicas": ${{ env.MIN_REPLICAS }},
-            "max_replicas": ${{ env.MAX_REPLICAS }},
-            "build_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          }
-          EOF
-
-          cat observability/build-info.json
-
-      # -------- Artifact Storage --------
-      - name: Upload security & observability artifacts
+      # ----------------------------
+      # Upload security artifacts
+      # ----------------------------
+      - name: Upload security artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: devsecops-artifacts
+          name: dev-security-scan
           path: |
             trivy-results.sarif
-            sbom.json
-            observability/build-info.json
-          retention-days: 90
+          retention-days: 30
           if-no-files-found: warn
 
-      # -------- Image Push --------
+      # ----------------------------
+      # Push image to ACR
+      # ----------------------------
       - name: Push image to ACR
         id: push
         run: |
@@ -348,90 +280,40 @@ jobs:
             exit 1
           fi
 
-      # -------- Build Summary --------
+      # ----------------------------
+      # Build Summary
+      # ----------------------------
       - name: Build summary
         if: always()
         run: |
           cat << 'EOF'
           
-          ╔════════════════════════════════════════════════════════════╗
-          ║          🏗️  BUILD STAGE COMPLETED                         ║
-          ╚════════════════════════════════════════════════════════════╝
+          ╔════════════════════════════════════════════════════════╗
+          ║       🏗️  BUILD STAGE COMPLETED                        ║
+          ╚════════════════════════════════════════════════════════╝
           
           📦 Image: ${{ steps.img.outputs.IMAGE }}
           🔐 Security Status: ${{ steps.security.outputs.scan_status }}
           🛡️  Vulnerabilities - CRITICAL: ${{ steps.security.outputs.CRITICAL_VULNS }}, HIGH: ${{ steps.security.outputs.HIGH_VULNS }}
-          📄 SBOM: Generated ✓
           ⏱️  Timestamp: ${{ steps.meta.outputs.BUILD_TIMESTAMP }}
           ✅ Build Status: SUCCESS
           
           EOF
 
-  # ========== STAGE 2: DEPLOYMENT PREPARATION ==========
-  deploy-prep:
-    name: 🔧 Deployment Preparation
-    runs-on: ubuntu-latest
-    environment: production
-    needs: build
-    
-    outputs:
-      DEPLOYMENT_READY: ${{ steps.verify.outputs.ready }}
-
-    steps:
-
-      - name: Azure Login (OIDC)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Verify Azure resources exist
-        id: verify
-        run: |
-          echo "🔍 Verifying Azure resources..."
-
-          # Check Resource Group
-          if az group show -n "${{ env.RESOURCE_GROUP }}" >/dev/null 2>&1; then
-            echo "✅ Resource Group exists: ${{ env.RESOURCE_GROUP }}"
-          else
-            echo "❌ Resource Group not found: ${{ env.RESOURCE_GROUP }}"
-            exit 1
-          fi
-
-          # Check ACR
-          if az acr show -g "${{ env.RESOURCE_GROUP }}" -n "${{ env.REGISTRY_NAME }}" >/dev/null 2>&1; then
-            echo "✅ ACR exists: ${{ env.REGISTRY_NAME }}"
-          else
-            echo "❌ ACR not found: ${{ env.REGISTRY_NAME }}"
-            exit 1
-          fi
-
-          # Check Container App Environment
-          if az containerapp env show -g "${{ env.RESOURCE_GROUP }}" -n "${{ env.CONTAINER_APP_ENV }}" >/dev/null 2>&1; then
-            echo "✅ Container App Environment exists: ${{ env.CONTAINER_APP_ENV }}"
-          else
-            echo "❌ Container App Environment not found: ${{ env.CONTAINER_APP_ENV }}"
-            exit 1
-          fi
-
-          echo "ready=true" >> $GITHUB_OUTPUT
-          echo ""
-          echo "✅ All Azure resources verified successfully!"
-
-  # ========== STAGE 3: PRODUCTION DEPLOYMENT ==========
+  # ============================
+  # DEPLOY JOB
+  # ============================
   deploy:
     name: 🚀 Deploy to Azure Container Apps
     runs-on: ubuntu-latest
-    environment: production
-    needs: [build, deploy-prep]
-    
-    outputs:
-      DEPLOYMENT_STATUS: ${{ steps.deploy.outputs.status }}
-      DEPLOYED_IMAGE: ${{ needs.build.outputs.IMAGE }}
+    environment: dev
+    needs: build
 
     steps:
 
+      # ----------------------------
+      # Azure Login (OIDC)
+      # ----------------------------
       - name: Azure Login (OIDC)
         uses: azure/login@v2
         with:
@@ -439,31 +321,34 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # -------- Container App Creation/Verification --------
-      - name: Create or verify Container App
-        id: aca-setup
+      # ----------------------------
+      # Ensure Container App exists
+      # ----------------------------
+      - name: Ensure Container App exists
+        id: aca-create
+        shell: bash
         run: |
+          set -euo pipefail
+          
           echo "🔧 Setting up Container App..."
 
-          if az containerapp show -g "${{ env.RESOURCE_GROUP }}" -n "${{ env.CONTAINER_APP_NAME }}" >/dev/null 2>&1; then
-            echo "✅ Container App already exists"
+          if az containerapp show -g "${{ env.RG_ENV }}" -n "${{ env.APP_NAME }}" >/dev/null 2>&1; then
+            echo "✅ Container App exists"
             echo "app_exists=true" >> $GITHUB_OUTPUT
           else
             echo "📝 Creating Container App..."
             
             az containerapp create \
-              --name "${{ env.CONTAINER_APP_NAME }}" \
-              --resource-group "${{ env.RESOURCE_GROUP }}" \
-              --environment "${{ env.CONTAINER_APP_ENV }}" \
+              -g "${{ env.RG_ENV }}" \
+              -n "${{ env.APP_NAME }}" \
+              --environment "${{ env.CAE_ENV }}" \
               --image mcr.microsoft.com/azuredocs/containerapps-helloworld:latest \
-              --ingress external \
+              --ingress "${{ env.INGRESS_TYPE }}" \
               --target-port 80 \
               --transport auto \
               --min-replicas ${{ env.MIN_REPLICAS }} \
               --max-replicas ${{ env.MAX_REPLICAS }} \
-              --system-assigned \
-              --cpu 0.5 \
-              --memory 1Gi
+              --system-assigned
 
             if [ $? -eq 0 ]; then
               echo "✅ Container App created successfully"
@@ -474,51 +359,133 @@ jobs:
             fi
           fi
 
-      # -------- ACR Registry Configuration --------
-      - name: Configure ACR authentication
-        id: registry-config
+      # ----------------------------
+      # Verify AcrPull role
+      # ----------------------------
+      - name: Verify AcrPull role for Container App
+        id: role-check
+        shell: bash
         run: |
-          echo "🔐 Configuring ACR authentication..."
+          set -euo pipefail
 
-          ACR_ID=$(az acr show -g "${{ env.RESOURCE_GROUP }}" -n "${{ env.REGISTRY_NAME }}" --query id -o tsv)
-          
-          PRINCIPAL_ID=$(az containerapp show -g "${{ env.RESOURCE_GROUP }}" -n "${{ env.CONTAINER_APP_NAME }}" --query identity.principalId -o tsv)
+          echo "🔍 Verifying AcrPull role..."
 
-          if [ -z "$PRINCIPAL_ID" ]; then
-            echo "⚠️ Could not retrieve Container App principal ID"
-          else
-            # Assign AcrPull role to the Container App's system identity
-            az role assignment create \
-              --role "AcrPull" \
-              --assignee-object-id "$PRINCIPAL_ID" \
-              --scope "$ACR_ID" \
-              2>/dev/null || echo "⚠️ Role already assigned or skipped"
+          PRINCIPAL_ID=$(az containerapp show \
+            -g "${{ env.RG_ENV }}" \
+            -n "${{ env.APP_NAME }}" \
+            --query identity.principalId \
+            -o tsv)
+
+          if [[ -z "$PRINCIPAL_ID" ]]; then
+            echo "❌ Container App has no system-assigned identity"
+            exit 1
           fi
 
-          # Set ACR registry
+          echo "✅ Container App identity: $PRINCIPAL_ID"
+
+          ACR_ID=$(az acr show \
+            -g "${{ env.RG_SHARED }}" \
+            -n "${{ env.ACR_NAME }}" \
+            --query id \
+            -o tsv)
+
+          echo "✅ ACR ID: $ACR_ID"
+
+          ROLE_COUNT=$(az role assignment list \
+            --assignee "$PRINCIPAL_ID" \
+            --scope "$ACR_ID" \
+            --role AcrPull \
+            --query "length(@)" \
+            -o tsv)
+
+          if [[ "$ROLE_COUNT" -eq 0 ]]; then
+            echo "⚠️ AcrPull role NOT assigned - assigning now..."
+            
+            az role assignment create \
+              --role AcrPull \
+              --assignee-object-id "$PRINCIPAL_ID" \
+              --scope "$ACR_ID" \
+              2>/dev/null || echo "⚠️ Role assignment already exists"
+            
+            echo "✅ AcrPull role assigned"
+          else
+            echo "✅ AcrPull role already assigned ($ROLE_COUNT assignment(s))"
+          fi
+
+      # ----------------------------
+      # Verify/Update ingress target port
+      # ----------------------------
+      - name: Verify ingress target port
+        id: ingress-check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "🔍 Verifying ingress target port..."
+
+          CURRENT_PORT=$(az containerapp show \
+            -g "${{ env.RG_ENV }}" \
+            -n "${{ env.APP_NAME }}" \
+            --query "properties.configuration.ingress.targetPort" \
+            -o tsv 2>/dev/null || echo "")
+
+          DESIRED_PORT="${{ env.APP_PORT }}"
+
+          echo "   Current port: $CURRENT_PORT"
+          echo "   Desired port: $DESIRED_PORT"
+
+          if [[ -z "$CURRENT_PORT" ]] || [[ "$CURRENT_PORT" != "$DESIRED_PORT" ]]; then
+            echo "📝 Updating ingress target port..."
+            
+            az containerapp ingress update \
+              -g "${{ env.RG_ENV }}" \
+              -n "${{ env.APP_NAME }}" \
+              --target-port "$DESIRED_PORT"
+
+            echo "✅ Ingress target port updated to $DESIRED_PORT"
+          else
+            echo "✅ Ingress target port already correct: $DESIRED_PORT"
+          fi
+
+      # ----------------------------
+      # Configure ACR registry
+      # ----------------------------
+      - name: Configure ACR registry (system identity)
+        id: registry-config
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "🔐 Configuring ACR registry..."
+
           az containerapp registry set \
-            --name "${{ env.CONTAINER_APP_NAME }}" \
-            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            -g "${{ env.RG_ENV }}" \
+            -n "${{ env.APP_NAME }}" \
             --server "${{ needs.build.outputs.LOGIN_SERVER }}" \
             --identity system
 
           if [ $? -eq 0 ]; then
-            echo "✅ ACR authentication configured"
+            echo "✅ ACR registry configured with system identity"
           else
-            echo "❌ Failed to configure ACR"
+            echo "❌ Failed to configure ACR registry"
             exit 1
           fi
 
-      # -------- Deploy New Image --------
-      - name: Deploy image to Container App
+      # ----------------------------
+      # Deploy image
+      # ----------------------------
+      - name: Deploy image
         id: deploy
+        shell: bash
         run: |
-          echo "📦 Deploying image to Azure Container Apps..."
+          set -euo pipefail
+
+          echo "📦 Deploying image..."
           echo "   Image: ${{ needs.build.outputs.IMAGE }}"
 
           az containerapp update \
-            --name "${{ env.CONTAINER_APP_NAME }}" \
-            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            -g "${{ env.RG_ENV }}" \
+            -n "${{ env.APP_NAME }}" \
             --image "${{ needs.build.outputs.IMAGE }}"
 
           if [ $? -eq 0 ]; then
@@ -530,19 +497,24 @@ jobs:
           fi
 
           echo ""
-          echo "⏳ Waiting for revision to become active..."
+          echo "⏳ Waiting for deployment to stabilize..."
           sleep 15
 
-      # -------- Deployment Validation --------
+      # ----------------------------
+      # Deployment validation
+      # ----------------------------
       - name: Validate deployment health
         id: health-check
+        shell: bash
         run: |
-          echo "🏥 Starting health validation..."
+          set -euo pipefail
+
+          echo "🏥 Validating deployment health..."
 
           # Get application URL
           APP_URL=$(az containerapp show \
-            -g "${{ env.RESOURCE_GROUP }}" \
-            -n "${{ env.CONTAINER_APP_NAME }}" \
+            -g "${{ env.RG_ENV }}" \
+            -n "${{ env.APP_NAME }}" \
             --query properties.configuration.ingress.fqdn -o tsv 2>/dev/null || echo "")
 
           if [ -z "$APP_URL" ]; then
@@ -553,7 +525,6 @@ jobs:
           echo "🔗 Application URL: https://$APP_URL"
           echo ""
 
-          # Health check with retries
           RETRY_COUNT=0
           MAX_RETRIES=${{ env.HEALTH_CHECK_RETRIES }}
           WAIT_TIME=30
@@ -583,42 +554,40 @@ jobs:
           echo "⚠️ Health check timed out after $((MAX_RETRIES * WAIT_TIME)) seconds"
           echo "health_status=timeout" >> $GITHUB_OUTPUT
 
-      # -------- Get Deployment Status --------
-      - name: Show deployment status
+      # ----------------------------
+      # Status
+      # ----------------------------
+      - name: Show app status
         if: always()
+        shell: bash
         run: |
           echo "📋 Container App Status:"
           echo ""
           
           az containerapp show \
-            -g "${{ env.RESOURCE_GROUP }}" \
-            -n "${{ env.CONTAINER_APP_NAME }}" \
-            --query "{
-              State:properties.provisioningState,
-              URL:properties.configuration.ingress.fqdn,
-              LatestRevision:properties.latestReadyRevisionName,
-              MinReplicas:properties.template.scale.minReplicas,
-              MaxReplicas:properties.template.scale.maxReplicas
-            }" \
+            -g "${{ env.RG_ENV }}" \
+            -n "${{ env.APP_NAME }}" \
+            --query "{state:properties.provisioningState,fqdn:properties.configuration.ingress.fqdn,revision:properties.latestReadyRevisionName,minReplicas:properties.template.scale.minReplicas,maxReplicas:properties.template.scale.maxReplicas}" \
             -o table
 
       - name: Get application logs (last 50 lines)
         if: always()
         continue-on-error: true
+        shell: bash
         run: |
           echo ""
           echo "📝 Recent application logs:"
           echo ""
           
           REVISION=$(az containerapp show \
-            -g "${{ env.RESOURCE_GROUP }}" \
-            -n "${{ env.CONTAINER_APP_NAME }}" \
+            -g "${{ env.RG_ENV }}" \
+            -n "${{ env.APP_NAME }}" \
             --query properties.latestReadyRevisionName -o tsv 2>/dev/null || echo "")
 
           if [ ! -z "$REVISION" ]; then
             az containerapp logs show \
-              --name "${{ env.CONTAINER_APP_NAME }}" \
-              --resource-group "${{ env.RESOURCE_GROUP }}" \
+              --name "${{ env.APP_NAME }}" \
+              --resource-group "${{ env.RG_ENV }}" \
               --revision "$REVISION" \
               --tail 50 \
               2>/dev/null || echo "⚠️ Logs not yet available"
@@ -626,11 +595,34 @@ jobs:
             echo "⚠️ No revision found for logs"
           fi
 
-  # ========== STAGE 4: POST-DEPLOYMENT VALIDATION ==========
+      # ----------------------------
+      # Deployment Summary
+      # ----------------------------
+      - name: Deployment summary
+        if: always()
+        run: |
+          cat << 'EOF'
+          
+          ╔════════════════════════════════════════════════════════╗
+          ║      🚀  DEPLOYMENT STAGE COMPLETED                    ║
+          ╚════════════════════════════════════════════════════════╝
+          
+          📦 Image: ${{ needs.build.outputs.IMAGE }}
+          🏢 App Name: ${{ env.APP_NAME }}
+          📍 Resource Group: ${{ env.RG_ENV }}
+          🔐 Security Status: ${{ needs.build.outputs.SCAN_STATUS }}
+          ⏱️  Timestamp: ${{ needs.build.outputs.BUILD_TIMESTAMP }}
+          ✅ Deployment Status: ${{ steps.deploy.outputs.status }}
+          
+          EOF
+
+  # ============================
+  # VALIDATION
+  # ============================
   validate:
     name: ✅ Post-Deployment Validation
     runs-on: ubuntu-latest
-    environment: production
+    environment: dev
     needs: [build, deploy]
     if: always()
 
@@ -644,19 +636,21 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Verify deployed image
+        id: verify-image
+        shell: bash
         run: |
-          echo "🔍 Verifying deployment..."
+          echo "🔍 Verifying deployed image..."
           echo ""
 
           CURRENT_IMAGE=$(az containerapp show \
-            -g "${{ env.RESOURCE_GROUP }}" \
-            -n "${{ env.CONTAINER_APP_NAME }}" \
+            -g "${{ env.RG_ENV }}" \
+            -n "${{ env.APP_NAME }}" \
             --query 'properties.template.containers[0].image' -o tsv 2>/dev/null || echo "")
 
           EXPECTED_IMAGE="${{ needs.build.outputs.IMAGE }}"
 
-          echo "Expected Image: $EXPECTED_IMAGE"
-          echo "Current Image:  $CURRENT_IMAGE"
+          echo "Expected: $EXPECTED_IMAGE"
+          echo "Current:  $CURRENT_IMAGE"
           echo ""
 
           if [ "$CURRENT_IMAGE" == "$EXPECTED_IMAGE" ]; then
@@ -665,90 +659,81 @@ jobs:
             echo "⚠️ Image mismatch - deployment may still be in progress"
           fi
 
-      - name: Verify health status
+      - name: Verify deployment state
+        id: verify-state
+        shell: bash
         run: |
-          echo "🏥 Checking Container App health..."
+          echo "🏥 Checking Container App state..."
           echo ""
 
           STATE=$(az containerapp show \
-            -g "${{ env.RESOURCE_GROUP }}" \
-            -n "${{ env.CONTAINER_APP_NAME }}" \
+            -g "${{ env.RG_ENV }}" \
+            -n "${{ env.APP_NAME }}" \
             --query properties.provisioningState -o tsv 2>/dev/null || echo "Unknown")
 
           if [ "$STATE" == "Succeeded" ] || [ "$STATE" == "provisioned" ]; then
-            echo "✅ Container App is provisioned: $STATE"
+            echo "✅ Container App provisioned: $STATE"
           else
             echo "⚠️ Container App state: $STATE"
           fi
 
-      - name: Validate replica configuration
+      - name: Verify replica configuration
+        id: verify-replicas
+        shell: bash
         run: |
-          echo "📊 Validating replica configuration..."
+          echo "📊 Verifying replica configuration..."
           echo ""
 
           MIN=$(az containerapp show \
-            -g "${{ env.RESOURCE_GROUP }}" \
-            -n "${{ env.CONTAINER_APP_NAME }}" \
+            -g "${{ env.RG_ENV }}" \
+            -n "${{ env.APP_NAME }}" \
             --query 'properties.template.scale.minReplicas' -o tsv 2>/dev/null || echo "0")
 
           MAX=$(az containerapp show \
-            -g "${{ env.RESOURCE_GROUP }}" \
-            -n "${{ env.CONTAINER_APP_NAME }}" \
+            -g "${{ env.RG_ENV }}" \
+            -n "${{ env.APP_NAME }}" \
             --query 'properties.template.scale.maxReplicas' -o tsv 2>/dev/null || echo "0")
 
           echo "Min Replicas: $MIN"
           echo "Max Replicas: $MAX"
           echo ""
-          echo "✅ Replica configuration validated"
+          echo "✅ Replica configuration verified"
 
-      - name: Create deployment summary
+      - name: Create deployment summary artifact
         if: always()
+        shell: bash
         run: |
           cat > deployment-summary.txt << 'EOF'
-          ╔════════════════════════════════════════════════════════════╗
-          ║       🚀  PRODUCTION DEPLOYMENT COMPLETED                  ║
-          ╚════════════════════════════════════════════════════════════╝
+          ╔════════════════════════════════════════════════════════╗
+          ║    🚀  DEV DEPLOYMENT COMPLETED SUCCESSFULLY           ║
+          ╚════════════════════════════════════════════════════════╝
           
           📦 Deployment Information
-          ────────────────────────────────────────────────────────────
-          Application: ${{ env.CONTAINER_APP_NAME }}
+          ────────────────────────────────────────────────────────
+          Application: ${{ env.APP_NAME }}
           Image: ${{ needs.build.outputs.IMAGE }}
-          Resource Group: ${{ env.RESOURCE_GROUP }}
-          Container App Environment: ${{ env.CONTAINER_APP_ENV }}
+          Resource Group: ${{ env.RG_ENV }}
+          Container App Env: ${{ env.CAE_ENV }}
           
           🔐 Security
-          ────────────────────────────────────────────────────────────
+          ────────────────────────────────────────────────────────
           Build Status: ${{ needs.build.outputs.SCAN_STATUS }}
           Trivy Scan: ✅ Passed
-          SBOM: ✅ Generated
-          Artifact Retention: 90 days
           
-          📊 Scaling Configuration
-          ────────────────────────────────────────────────────────────
+          📊 Scaling
+          ────────────────────────────────────────────────────────
           Min Replicas: ${{ env.MIN_REPLICAS }}
           Max Replicas: ${{ env.MAX_REPLICAS }}
-          Target CPU: 0.5
-          Target Memory: 1Gi
-          
-          🔗 Access
-          ────────────────────────────────────────────────────────────
-          Registry: ${{ needs.build.outputs.LOGIN_SERVER }}
-          Auth Method: System-Assigned Identity (OIDC)
+          Target Port: ${{ env.APP_PORT }}
           
           ⏱️  Metadata
-          ────────────────────────────────────────────────────────────
+          ────────────────────────────────────────────────────────
+          Image Tag: ${{ needs.build.outputs.IMAGE_TAG }}
           Build Time: ${{ needs.build.outputs.BUILD_TIMESTAMP }}
-          Deployment Status: ${{ needs.deploy.outputs.DEPLOYMENT_STATUS }}
-          Run ID: ${{ github.run_id }}
+          Trigger: ${{ github.event_name }}
+          Branch: ${{ github.ref_name }}
           
-          📋 Verification Status
-          ────────────────────────────────────────────────────────────
-          ✅ All validations passed
-          ✅ Resources verified
-          ✅ Image deployed
-          ✅ Health checks completed
-          
-          🎉 Status: DEPLOYMENT SUCCESSFUL
+          ✅ Status: DEPLOYMENT SUCCESSFUL
           EOF
           
           cat deployment-summary.txt
@@ -757,15 +742,17 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: deployment-summary
+          name: dev-deployment-summary
           path: deployment-summary.txt
           retention-days: 30
 
-  # ========== STAGE 5: NOTIFICATIONS & COMPLETION ==========
+  # ============================
+  # NOTIFICATIONS
+  # ============================
   notifications:
-    name: 📢 Notifications & Alerts
+    name: 📢 Notifications
     runs-on: ubuntu-latest
-    environment: production
+    environment: dev
     needs: [build, deploy, validate]
     if: always()
 
@@ -793,13 +780,13 @@ jobs:
         with:
           payload: |
             {
-              "text": "${{ steps.status.outputs.emoji }} Production Deployment Notification",
+              "text": "${{ steps.status.outputs.emoji }} Dev Deployment Notification",
               "blocks": [
                 {
                   "type": "header",
                   "text": {
                     "type": "plain_text",
-                    "text": "${{ steps.status.outputs.emoji }} Production Deployment Status",
+                    "text": "${{ steps.status.outputs.emoji }} Dev Deployment Status",
                     "emoji": true
                   }
                 },
@@ -824,7 +811,7 @@ jobs:
                     },
                     {
                       "type": "mrkdwn",
-                      "text": "*Deployed By:*\n${{ github.actor }}"
+                      "text": "*Branch:*\n${{ github.ref_name }}"
                     },
                     {
                       "type": "mrkdwn",
@@ -835,16 +822,16 @@ jobs:
               ]
             }
 
-      - name: Production deployment complete
+      - name: Dev deployment complete
         run: |
           cat << 'EOF'
           
-          ╔════════════════════════════════════════════════════════════╗
-          ║   🚀  PRODUCTION DEPLOYMENT PIPELINE COMPLETE               ║
-          ╚════════════════════════════════════════════════════════════╝
+          ╔════════════════════════════════════════════════════════╗
+          ║   🚀  DEV DEPLOYMENT PIPELINE COMPLETE                 ║
+          ╚════════════════════════════════════════════════════════╝
           
           ✅ Build Stage: Passed
-          ✅ Security Scanning: Completed
+          ✅ Security Scanning: Passed
           ✅ Deployment: Completed
           ✅ Validation: Passed
           
@@ -852,25 +839,21 @@ jobs:
           🔐 Security Status: ${{ needs.build.outputs.SCAN_STATUS }}
           ⏱️  Build Timestamp: ${{ needs.build.outputs.BUILD_TIMESTAMP }}
           
-          📁 Artifacts:
-          - devsecops-artifacts (Trivy reports, SBOM, build-info)
-          - deployment-summary (Deployment details)
-          
           🔗 Resources:
-          - Container App: ${{ env.CONTAINER_APP_NAME }}
-          - Resource Group: ${{ env.RESOURCE_GROUP }}
-          - ACR: ${{ env.REGISTRY_NAME }}
+          - Container App: ${{ env.APP_NAME }}
+          - Resource Group: ${{ env.RG_ENV }}
+          - ACR: ${{ env.ACR_NAME }}
+          
+          📁 Artifacts:
+          - dev-security-scan
+          - dev-deployment-summary
           
           🎯 Next Steps:
-          1. Monitor application in Azure Portal
+          1. Monitor application health
           2. Review security scan results
-          3. Verify health metrics
-          4. Plan scaling based on performance
+          3. Verify application logs
+          4. Monitor performance metrics
           
-          📊 Pipeline Run: ${{ github.run_id }}
-          👤 Triggered By: ${{ github.actor }}
-          🔗 Repo: ${{ github.repository }}
-          
-          ────────────────────────────────────────────────────────────
+          ────────────────────────────────────────────────────────
           
           EOF
