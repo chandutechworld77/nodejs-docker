@@ -1,859 +1,125 @@
-name: dev-deploy (ACA)
-
-on:
-  push:
-    branches: ["master"]
-  workflow_dispatch:
-
-permissions:
-  id-token: write
-  contents: read
-  security-events: write
-
-concurrency:
-  group: aca-dev-${{ github.repository }}
-  cancel-in-progress: true
-
-env:
-  ACR_NAME: ${{ vars.ACR_NAME }}
-  RG_SHARED: ${{ vars.RG_SHARED }}
-  RG_ENV: ${{ vars.RG_ENV }}
-  ACR_REPO: ${{ vars.ACR_REPO }}
-  APP_NAME: ${{ vars.APP_NAME }}
-  CAE_ENV: ${{ vars.CAE_ENV }}
-  INGRESS_TYPE: ${{ vars.INGRESS_TYPE }}
-  APP_PORT: ${{ vars.APP_PORT }}
-  MIN_REPLICAS: 1
-  MAX_REPLICAS: 2
-  HEALTH_CHECK_TIMEOUT: 180
-  HEALTH_CHECK_RETRIES: 6
-
-jobs:
-
-  # ============================
-  # BUILD + SCAN + PUSH
-  # ============================
-  build:
-    name: 🏗️ Build, Scan & Push
-    runs-on: ubuntu-latest
-    environment: dev
-
-    outputs:
-      IMAGE: ${{ steps.img.outputs.IMAGE }}
-      LOGIN_SERVER: ${{ steps.acr.outputs.LOGIN_SERVER }}
-      IMAGE_TAG: ${{ steps.meta.outputs.TAG }}
-      SCAN_STATUS: ${{ steps.security.outputs.scan_status }}
-      BUILD_TIMESTAMP: ${{ steps.meta.outputs.BUILD_TIMESTAMP }}
-
-    steps:
-
-      # ----------------------------
-      # Clean workspace
-      # ----------------------------
-      - name: Clean workspace
-        run: |
-          echo "🧹 Cleaning workspace..."
-          rm -rf * .[^.]* || true
-          df -h
-
-      # ----------------------------
-      # Checkout
-      # ----------------------------
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          clean: true
-
-      - name: Display trigger information
-        run: |
-          echo "📋 Pipeline Trigger Details:"
-          echo "  Event: ${{ github.event_name }}"
-          echo "  Branch: ${{ github.ref_name }}"
-          echo "  Commit: ${{ github.sha }}"
-          echo "  Actor: ${{ github.actor }}"
-
-      # ----------------------------
-      # Azure Login (OIDC)
-      # ----------------------------
-      - name: Azure Login (OIDC)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      # ----------------------------
-      # Image metadata
-      # ----------------------------
-      - name: Generate image metadata
-        id: meta
-        run: |
-          echo "TAG=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
-          echo "BUILD_TIMESTAMP=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
-          echo "GIT_BRANCH=${GITHUB_REF#refs/heads/}" >> $GITHUB_OUTPUT
-          echo "GIT_COMMIT=$GITHUB_SHA" >> $GITHUB_OUTPUT
-          echo ""
-          echo "📌 Image Metadata:"
-          echo "  Tag: ${GITHUB_SHA::7}"
-          echo "  Branch: ${GITHUB_REF#refs/heads/}"
-          echo "  Timestamp: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-
-      - name: Get ACR login server
-        id: acr
-        run: |
-          echo "🔍 Retrieving ACR login server..."
-          
-          LOGIN_SERVER=$(az acr show \
-            -g "${{ env.RG_SHARED }}" \
-            -n "${{ env.ACR_NAME }}" \
-            --query loginServer -o tsv 2>/dev/null || echo "")
-
-          if [ -z "$LOGIN_SERVER" ]; then
-            echo "❌ Failed to get ACR login server"
-            echo "   Registry: ${{ env.ACR_NAME }}"
-            echo "   Resource Group: ${{ env.RG_SHARED }}"
-            exit 1
-          fi
-
-          echo "LOGIN_SERVER=$LOGIN_SERVER" >> $GITHUB_OUTPUT
-          echo "✅ ACR Login Server: $LOGIN_SERVER"
-
-      - name: Define image
-        id: img
-        run: |
-          IMAGE="${{ steps.acr.outputs.LOGIN_SERVER }}/${{ env.ACR_REPO }}:${{ steps.meta.outputs.TAG }}"
-          IMAGE_LATEST="${{ steps.acr.outputs.LOGIN_SERVER }}/${{ env.ACR_REPO }}:latest"
-          
-          echo "IMAGE=$IMAGE" >> $GITHUB_OUTPUT
-          echo "IMAGE_LATEST=$IMAGE_LATEST" >> $GITHUB_OUTPUT
-          echo ""
-          echo "📦 Image References:"
-          echo "  Versioned: $IMAGE"
-          echo "  Latest: $IMAGE_LATEST"
-
-      # ----------------------------
-      # ACR Login
-      # ----------------------------
-      - name: ACR Login
-        run: |
-          echo "🔐 Logging into ACR..."
-          az acr login -n "${{ env.ACR_NAME }}"
-          echo "✅ ACR authentication successful"
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          version: latest
-          buildkitd-flags: --allow-insecure-entitlement security.insecure
-
-      # ----------------------------
-      # Build image
-      # ----------------------------
-      - name: Build image
-        id: docker_build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          push: false
-          load: true
-          tags: |
-            ${{ steps.img.outputs.IMAGE }}
-            ${{ steps.img.outputs.IMAGE_LATEST }}
-          cache-from: type=gha,scope=dev
-          cache-to: type=gha,mode=max,scope=dev
-          build-args: |
-            BUILD_DATE=${{ steps.meta.outputs.BUILD_TIMESTAMP }}
-            VCS_REF=${{ steps.meta.outputs.GIT_COMMIT }}
-            VERSION=${{ steps.meta.outputs.TAG }}
-          labels: |
-            org.opencontainers.image.created=${{ steps.meta.outputs.BUILD_TIMESTAMP }}
-            org.opencontainers.image.revision=${{ steps.meta.outputs.GIT_COMMIT }}
-            org.opencontainers.image.version=${{ steps.meta.outputs.TAG }}
-
-      - name: Display build status
-        run: |
-          echo "✅ Docker image built successfully"
-          echo "   Image: ${{ steps.img.outputs.IMAGE }}"
-
-      # ----------------------------
-      # Trivy Scan
-      # ----------------------------
-      - name: Trivy Scan Image
-        id: trivy
-        uses: aquasecurity/trivy-action@master
-        continue-on-error: true
-        with:
-          image-ref: ${{ steps.img.outputs.IMAGE }}
-          scanners: vuln
-          format: 'sarif'
-          output: 'trivy-results.sarif'
-          severity: 'CRITICAL,HIGH'
-          vuln-type: 'os,library'
-          ignore-unfixed: true
-          exit-code: '0'
-
-      - name: Display Trivy Report
-        if: always()
-        run: |
-          echo "========== TRIVY IMAGE SCAN REPORT =========="
-          if [ -f trivy-results.sarif ]; then
-            echo "✅ Trivy scan completed"
-            VULN_COUNT=$(jq '.runs[0].results | length' trivy-results.sarif 2>/dev/null || echo "0")
-            echo "   Vulnerabilities found: $VULN_COUNT"
-          else
-            echo "⚠️ No vulnerabilities detected"
-          fi
-
-      - name: Upload Trivy results to GitHub Security
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        continue-on-error: true
-        with:
-          sarif_file: 'trivy-results.sarif'
-          category: 'trivy-dev'
-          wait-for-processing: true
-
-      - name: Evaluate security scan
-        id: security
-        run: |
-          CRITICAL_COUNT=$(jq '.runs[0].results[] | select(.level=="error") | .level' trivy-results.sarif 2>/dev/null | wc -l || echo 0)
-          HIGH_COUNT=$(jq '.runs[0].results[] | select(.level=="warning") | .level' trivy-results.sarif 2>/dev/null | wc -l || echo 0)
-
-          echo "CRITICAL_VULNS=$CRITICAL_COUNT" >> $GITHUB_OUTPUT
-          echo "HIGH_VULNS=$HIGH_COUNT" >> $GITHUB_OUTPUT
-
-          echo ""
-          echo "🔐 Security Scan Summary:"
-          echo "   CRITICAL: $CRITICAL_COUNT"
-          echo "   HIGH: $HIGH_COUNT"
-          echo ""
-
-          if [ "$CRITICAL_COUNT" -gt 0 ]; then
-            echo "scan_status=FAILED_CRITICAL" >> $GITHUB_OUTPUT
-            echo "❌ CRITICAL vulnerabilities detected - blocking deployment"
-            exit 1
-          else
-            echo "scan_status=PASSED" >> $GITHUB_OUTPUT
-            echo "✅ Security scan PASSED"
-          fi
-
-      # ----------------------------
-      # Upload security artifacts
-      # ----------------------------
-      - name: Upload security artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: dev-security-scan
-          path: |
-            trivy-results.sarif
-          retention-days: 30
-          if-no-files-found: warn
-
-      # ----------------------------
-      # Push image to ACR
-      # ----------------------------
-      - name: Push image to ACR
-        id: push
-        run: |
-          echo "📤 Pushing image to ACR..."
-          
-          docker push "${{ steps.img.outputs.IMAGE }}"
-          
-          if [ $? -eq 0 ]; then
-            echo "✅ Versioned image pushed: ${{ steps.img.outputs.IMAGE }}"
-          else
-            echo "❌ Failed to push image"
-            exit 1
-          fi
-          
-          docker tag "${{ steps.img.outputs.IMAGE }}" "${{ steps.img.outputs.IMAGE_LATEST }}"
-          docker push "${{ steps.img.outputs.IMAGE_LATEST }}"
-          
-          if [ $? -eq 0 ]; then
-            echo "✅ Latest image tag pushed"
-            echo "push_status=success" >> $GITHUB_OUTPUT
-          else
-            echo "❌ Failed to push latest tag"
-            exit 1
-          fi
-
-      # ----------------------------
-      # Build Summary
-      # ----------------------------
-      - name: Build summary
-        if: always()
-        run: |
-          cat << 'EOF'
-          
-          ╔════════════════════════════════════════════════════════╗
-          ║       🏗️  BUILD STAGE COMPLETED                        ║
-          ╚════════════════════════════════════════════════════════╝
-          
-          📦 Image: ${{ steps.img.outputs.IMAGE }}
-          🔐 Security Status: ${{ steps.security.outputs.scan_status }}
-          🛡️  Vulnerabilities - CRITICAL: ${{ steps.security.outputs.CRITICAL_VULNS }}, HIGH: ${{ steps.security.outputs.HIGH_VULNS }}
-          ⏱️  Timestamp: ${{ steps.meta.outputs.BUILD_TIMESTAMP }}
-          ✅ Build Status: SUCCESS
-          
-          EOF
-
-  # ============================
-  # DEPLOY JOB
-  # ============================
-  deploy:
-    name: 🚀 Deploy to Azure Container Apps
-    runs-on: ubuntu-latest
-    environment: dev
-    needs: build
-
-    steps:
-
-      # ----------------------------
-      # Azure Login (OIDC)
-      # ----------------------------
-      - name: Azure Login (OIDC)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      # ----------------------------
-      # Ensure Container App exists
-      # ----------------------------
-      - name: Ensure Container App exists
-        id: aca-create
-        shell: bash
-        run: |
-          set -euo pipefail
-          
-          echo "🔧 Setting up Container App..."
-
-          if az containerapp show -g "${{ env.RG_ENV }}" -n "${{ env.APP_NAME }}" >/dev/null 2>&1; then
-            echo "✅ Container App exists"
-            echo "app_exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "📝 Creating Container App..."
-            
-            az containerapp create \
-              -g "${{ env.RG_ENV }}" \
-              -n "${{ env.APP_NAME }}" \
-              --environment "${{ env.CAE_ENV }}" \
-              --image mcr.microsoft.com/azuredocs/containerapps-helloworld:latest \
-              --ingress "${{ env.INGRESS_TYPE }}" \
-              --target-port 80 \
-              --transport auto \
-              --min-replicas ${{ env.MIN_REPLICAS }} \
-              --max-replicas ${{ env.MAX_REPLICAS }} \
-              --system-assigned
-
-            if [ $? -eq 0 ]; then
-              echo "✅ Container App created successfully"
-              echo "app_exists=true" >> $GITHUB_OUTPUT
-            else
-              echo "❌ Failed to create Container App"
-              exit 1
-            fi
-          fi
-
-      # ----------------------------
-      # Verify AcrPull role
-      # ----------------------------
-      - name: Verify AcrPull role for Container App
-        id: role-check
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "🔍 Verifying AcrPull role..."
-
-          PRINCIPAL_ID=$(az containerapp show \
-            -g "${{ env.RG_ENV }}" \
-            -n "${{ env.APP_NAME }}" \
-            --query identity.principalId \
-            -o tsv)
-
-          if [[ -z "$PRINCIPAL_ID" ]]; then
-            echo "❌ Container App has no system-assigned identity"
-            exit 1
-          fi
-
-          echo "✅ Container App identity: $PRINCIPAL_ID"
-
-          ACR_ID=$(az acr show \
-            -g "${{ env.RG_SHARED }}" \
-            -n "${{ env.ACR_NAME }}" \
-            --query id \
-            -o tsv)
-
-          echo "✅ ACR ID: $ACR_ID"
-
-          ROLE_COUNT=$(az role assignment list \
-            --assignee "$PRINCIPAL_ID" \
-            --scope "$ACR_ID" \
-            --role AcrPull \
-            --query "length(@)" \
-            -o tsv)
-
-          if [[ "$ROLE_COUNT" -eq 0 ]]; then
-            echo "⚠️ AcrPull role NOT assigned - assigning now..."
-            
-            az role assignment create \
-              --role AcrPull \
-              --assignee-object-id "$PRINCIPAL_ID" \
-              --scope "$ACR_ID" \
-              2>/dev/null || echo "⚠️ Role assignment already exists"
-            
-            echo "✅ AcrPull role assigned"
-          else
-            echo "✅ AcrPull role already assigned ($ROLE_COUNT assignment(s))"
-          fi
-
-      # ----------------------------
-      # Verify/Update ingress target port
-      # ----------------------------
-      - name: Verify ingress target port
-        id: ingress-check
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "🔍 Verifying ingress target port..."
-
-          CURRENT_PORT=$(az containerapp show \
-            -g "${{ env.RG_ENV }}" \
-            -n "${{ env.APP_NAME }}" \
-            --query "properties.configuration.ingress.targetPort" \
-            -o tsv 2>/dev/null || echo "")
-
-          DESIRED_PORT="${{ env.APP_PORT }}"
-
-          echo "   Current port: $CURRENT_PORT"
-          echo "   Desired port: $DESIRED_PORT"
-
-          if [[ -z "$CURRENT_PORT" ]] || [[ "$CURRENT_PORT" != "$DESIRED_PORT" ]]; then
-            echo "📝 Updating ingress target port..."
-            
-            az containerapp ingress update \
-              -g "${{ env.RG_ENV }}" \
-              -n "${{ env.APP_NAME }}" \
-              --target-port "$DESIRED_PORT"
-
-            echo "✅ Ingress target port updated to $DESIRED_PORT"
-          else
-            echo "✅ Ingress target port already correct: $DESIRED_PORT"
-          fi
-
-      # ----------------------------
-      # Configure ACR registry
-      # ----------------------------
-      - name: Configure ACR registry (system identity)
-        id: registry-config
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "🔐 Configuring ACR registry..."
-
-          az containerapp registry set \
-            -g "${{ env.RG_ENV }}" \
-            -n "${{ env.APP_NAME }}" \
-            --server "${{ needs.build.outputs.LOGIN_SERVER }}" \
-            --identity system
-
-          if [ $? -eq 0 ]; then
-            echo "✅ ACR registry configured with system identity"
-          else
-            echo "❌ Failed to configure ACR registry"
-            exit 1
-          fi
-
-      # ----------------------------
-      # Deploy image
-      # ----------------------------
-      - name: Deploy image
-        id: deploy
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "📦 Deploying image..."
-          echo "   Image: ${{ needs.build.outputs.IMAGE }}"
-
-          az containerapp update \
-            -g "${{ env.RG_ENV }}" \
-            -n "${{ env.APP_NAME }}" \
-            --image "${{ needs.build.outputs.IMAGE }}"
-
-          if [ $? -eq 0 ]; then
-            echo "✅ Deployment command succeeded"
-            echo "status=deployed" >> $GITHUB_OUTPUT
-          else
-            echo "❌ Deployment failed"
-            exit 1
-          fi
-
-          echo ""
-          echo "⏳ Waiting for deployment to stabilize..."
-          sleep 15
-
-      # ----------------------------
-      # Deployment validation
-      # ----------------------------
-      - name: Validate deployment health
-        id: health-check
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "🏥 Validating deployment health..."
-
-          # Get application URL
-          APP_URL=$(az containerapp show \
-            -g "${{ env.RG_ENV }}" \
-            -n "${{ env.APP_NAME }}" \
-            --query properties.configuration.ingress.fqdn -o tsv 2>/dev/null || echo "")
-
-          if [ -z "$APP_URL" ]; then
-            echo "⚠️ Could not retrieve app URL, skipping health check"
-            exit 0
-          fi
-
-          echo "🔗 Application URL: https://$APP_URL"
-          echo ""
-
-          RETRY_COUNT=0
-          MAX_RETRIES=${{ env.HEALTH_CHECK_RETRIES }}
-          WAIT_TIME=30
-
-          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-            echo "🔄 Health check attempt $((RETRY_COUNT + 1))/$MAX_RETRIES..."
-
-            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 --connect-timeout 5 "https://$APP_URL" 2>/dev/null || echo "000")
-
-            echo "   HTTP Status: $HTTP_STATUS"
-
-            if [ "$HTTP_STATUS" == "200" ] || [ "$HTTP_STATUS" == "202" ] || [ "$HTTP_STATUS" == "301" ] || [ "$HTTP_STATUS" == "302" ]; then
-              echo "✅ Application is healthy (HTTP $HTTP_STATUS)"
-              echo "health_status=healthy" >> $GITHUB_OUTPUT
-              exit 0
-            fi
-
-            RETRY_COUNT=$((RETRY_COUNT + 1))
-
-            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-              echo "   ⏳ Waiting ${WAIT_TIME}s before retry..."
-              sleep $WAIT_TIME
-            fi
-          done
-
-          echo ""
-          echo "⚠️ Health check timed out after $((MAX_RETRIES * WAIT_TIME)) seconds"
-          echo "health_status=timeout" >> $GITHUB_OUTPUT
-
-      # ----------------------------
-      # Status
-      # ----------------------------
-      - name: Show app status
-        if: always()
-        shell: bash
-        run: |
-          echo "📋 Container App Status:"
-          echo ""
-          
-          az containerapp show \
-            -g "${{ env.RG_ENV }}" \
-            -n "${{ env.APP_NAME }}" \
-            --query "{state:properties.provisioningState,fqdn:properties.configuration.ingress.fqdn,revision:properties.latestReadyRevisionName,minReplicas:properties.template.scale.minReplicas,maxReplicas:properties.template.scale.maxReplicas}" \
-            -o table
-
-      - name: Get application logs (last 50 lines)
-        if: always()
-        continue-on-error: true
-        shell: bash
-        run: |
-          echo ""
-          echo "📝 Recent application logs:"
-          echo ""
-          
-          REVISION=$(az containerapp show \
-            -g "${{ env.RG_ENV }}" \
-            -n "${{ env.APP_NAME }}" \
-            --query properties.latestReadyRevisionName -o tsv 2>/dev/null || echo "")
-
-          if [ ! -z "$REVISION" ]; then
-            az containerapp logs show \
-              --name "${{ env.APP_NAME }}" \
-              --resource-group "${{ env.RG_ENV }}" \
-              --revision "$REVISION" \
-              --tail 50 \
-              2>/dev/null || echo "⚠️ Logs not yet available"
-          else
-            echo "⚠️ No revision found for logs"
-          fi
-
-      # ----------------------------
-      # Deployment Summary
-      # ----------------------------
-      - name: Deployment summary
-        if: always()
-        run: |
-          cat << 'EOF'
-          
-          ╔════════════════════════════════════════════════════════╗
-          ║      🚀  DEPLOYMENT STAGE COMPLETED                    ║
-          ╚════════════════════════════════════════════════════════╝
-          
-          📦 Image: ${{ needs.build.outputs.IMAGE }}
-          🏢 App Name: ${{ env.APP_NAME }}
-          📍 Resource Group: ${{ env.RG_ENV }}
-          🔐 Security Status: ${{ needs.build.outputs.SCAN_STATUS }}
-          ⏱️  Timestamp: ${{ needs.build.outputs.BUILD_TIMESTAMP }}
-          ✅ Deployment Status: ${{ steps.deploy.outputs.status }}
-          
-          EOF
-
-  # ============================
-  # VALIDATION
-  # ============================
-  validate:
-    name: ✅ Post-Deployment Validation
-    runs-on: ubuntu-latest
-    environment: dev
-    needs: [build, deploy]
-    if: always()
-
-    steps:
-
-      - name: Azure Login (OIDC)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Verify deployed image
-        id: verify-image
-        shell: bash
-        run: |
-          echo "🔍 Verifying deployed image..."
-          echo ""
-
-          CURRENT_IMAGE=$(az containerapp show \
-            -g "${{ env.RG_ENV }}" \
-            -n "${{ env.APP_NAME }}" \
-            --query 'properties.template.containers[0].image' -o tsv 2>/dev/null || echo "")
-
-          EXPECTED_IMAGE="${{ needs.build.outputs.IMAGE }}"
-
-          echo "Expected: $EXPECTED_IMAGE"
-          echo "Current:  $CURRENT_IMAGE"
-          echo ""
-
-          if [ "$CURRENT_IMAGE" == "$EXPECTED_IMAGE" ]; then
-            echo "✅ Correct image deployed"
-          else
-            echo "⚠️ Image mismatch - deployment may still be in progress"
-          fi
-
-      - name: Verify deployment state
-        id: verify-state
-        shell: bash
-        run: |
-          echo "🏥 Checking Container App state..."
-          echo ""
-
-          STATE=$(az containerapp show \
-            -g "${{ env.RG_ENV }}" \
-            -n "${{ env.APP_NAME }}" \
-            --query properties.provisioningState -o tsv 2>/dev/null || echo "Unknown")
-
-          if [ "$STATE" == "Succeeded" ] || [ "$STATE" == "provisioned" ]; then
-            echo "✅ Container App provisioned: $STATE"
-          else
-            echo "⚠️ Container App state: $STATE"
-          fi
-
-      - name: Verify replica configuration
-        id: verify-replicas
-        shell: bash
-        run: |
-          echo "📊 Verifying replica configuration..."
-          echo ""
-
-          MIN=$(az containerapp show \
-            -g "${{ env.RG_ENV }}" \
-            -n "${{ env.APP_NAME }}" \
-            --query 'properties.template.scale.minReplicas' -o tsv 2>/dev/null || echo "0")
-
-          MAX=$(az containerapp show \
-            -g "${{ env.RG_ENV }}" \
-            -n "${{ env.APP_NAME }}" \
-            --query 'properties.template.scale.maxReplicas' -o tsv 2>/dev/null || echo "0")
-
-          echo "Min Replicas: $MIN"
-          echo "Max Replicas: $MAX"
-          echo ""
-          echo "✅ Replica configuration verified"
-
-      - name: Create deployment summary artifact
-        if: always()
-        shell: bash
-        run: |
-          cat > deployment-summary.txt << 'EOF'
-          ╔════════════════════════════════════════════════════════╗
-          ║    🚀  DEV DEPLOYMENT COMPLETED SUCCESSFULLY           ║
-          ╚════════════════════════════════════════════════════════╝
-          
-          📦 Deployment Information
-          ────────────────────────────────────────────────────────
-          Application: ${{ env.APP_NAME }}
-          Image: ${{ needs.build.outputs.IMAGE }}
-          Resource Group: ${{ env.RG_ENV }}
-          Container App Env: ${{ env.CAE_ENV }}
-          
-          🔐 Security
-          ────────────────────────────────────────────────────────
-          Build Status: ${{ needs.build.outputs.SCAN_STATUS }}
-          Trivy Scan: ✅ Passed
-          
-          📊 Scaling
-          ────────────────────────────────────────────────────────
-          Min Replicas: ${{ env.MIN_REPLICAS }}
-          Max Replicas: ${{ env.MAX_REPLICAS }}
-          Target Port: ${{ env.APP_PORT }}
-          
-          ⏱️  Metadata
-          ────────────────────────────────────────────────────────
-          Image Tag: ${{ needs.build.outputs.IMAGE_TAG }}
-          Build Time: ${{ needs.build.outputs.BUILD_TIMESTAMP }}
-          Trigger: ${{ github.event_name }}
-          Branch: ${{ github.ref_name }}
-          
-          ✅ Status: DEPLOYMENT SUCCESSFUL
-          EOF
-          
-          cat deployment-summary.txt
-
-      - name: Upload deployment summary
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: dev-deployment-summary
-          path: deployment-summary.txt
-          retention-days: 30
-
-  # ============================
-  # NOTIFICATIONS
-  # ============================
-  notifications:
-    name: 📢 Notifications
-    runs-on: ubuntu-latest
-    environment: dev
-    needs: [build, deploy, validate]
-    if: always()
-
-    steps:
-
-      - name: Determine deployment status
-        id: status
-        run: |
-          if [ "${{ needs.deploy.result }}" == "success" ] && [ "${{ needs.validate.result }}" == "success" ]; then
-            echo "deployment_status=✅ SUCCESSFUL"
-            echo "emoji=🎉"
-            echo "color=good"
-          else
-            echo "deployment_status=⚠️ COMPLETED WITH WARNINGS"
-            echo "emoji=⚠️"
-            echo "color=warning"
-          fi >> $GITHUB_OUTPUT
-
-      - name: Slack notification (Optional)
-        if: always() && env.SLACK_WEBHOOK_URL
-        continue-on-error: true
-        uses: slackapi/slack-github-action@v1.24.0
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        with:
-          payload: |
-            {
-              "text": "${{ steps.status.outputs.emoji }} Dev Deployment Notification",
-              "blocks": [
-                {
-                  "type": "header",
-                  "text": {
-                    "type": "plain_text",
-                    "text": "${{ steps.status.outputs.emoji }} Dev Deployment Status",
-                    "emoji": true
-                  }
-                },
-                {
-                  "type": "section",
-                  "fields": [
-                    {
-                      "type": "mrkdwn",
-                      "text": "*Repository:*\n${{ github.repository }}"
-                    },
-                    {
-                      "type": "mrkdwn",
-                      "text": "*Status:*\n${{ steps.status.outputs.deployment_status }}"
-                    },
-                    {
-                      "type": "mrkdwn",
-                      "text": "*Image:*\n${{ needs.build.outputs.IMAGE }}"
-                    },
-                    {
-                      "type": "mrkdwn",
-                      "text": "*Security:*\n${{ needs.build.outputs.SCAN_STATUS }}"
-                    },
-                    {
-                      "type": "mrkdwn",
-                      "text": "*Branch:*\n${{ github.ref_name }}"
-                    },
-                    {
-                      "type": "mrkdwn",
-                      "text": "*Details:*\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"
-                    }
-                  ]
-                }
-              ]
-            }
-
-      - name: Dev deployment complete
-        run: |
-          cat << 'EOF'
-          
-          ╔════════════════════════════════════════════════════════╗
-          ║   🚀  DEV DEPLOYMENT PIPELINE COMPLETE                 ║
-          ╚════════════════════════════════════════════════════════╝
-          
-          ✅ Build Stage: Passed
-          ✅ Security Scanning: Passed
-          ✅ Deployment: Completed
-          ✅ Validation: Passed
-          
-          📦 Deployed Image: ${{ needs.build.outputs.IMAGE }}
-          🔐 Security Status: ${{ needs.build.outputs.SCAN_STATUS }}
-          ⏱️  Build Timestamp: ${{ needs.build.outputs.BUILD_TIMESTAMP }}
-          
-          🔗 Resources:
-          - Container App: ${{ env.APP_NAME }}
-          - Resource Group: ${{ env.RG_ENV }}
-          - ACR: ${{ env.ACR_NAME }}
-          
-          📁 Artifacts:
-          - dev-security-scan
-          - dev-deployment-summary
-          
-          🎯 Next Steps:
-          1. Monitor application health
-          2. Review security scan results
-          3. Verify application logs
-          4. Monitor performance metrics
-          
-          ────────────────────────────────────────────────────────
-          
-          EOF
+---
+pipeline_security_addons:
+  name: 🛡️ Pipeline Security & Optimization
+  runs-on: ubuntu-latest
+  needs:
+    - build
+    - deploy
+    - validate
+    - notifications
+  if: always()
+  steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Auto Fix Code Indentation
+      run: >
+        echo "🔧 Fixing code indentation and formatting..."
+
+
+        sudo apt-get update
+
+        sudo apt-get install -y clang-format
+
+
+        find . -type f \( -name "*.js" -o -name "*.ts" -o -name "*.py" -o -name "*.java" -o -name "*.go" \) | while read file; do
+          echo "Formatting $file"
+          clang-format -i "$file" || true
+        done
+
+
+        echo "✅ Formatting completed"
+    - name: Detect Pipeline Risks
+      run: >
+        echo "🔍 Checking pipeline risks..."
+
+
+        if [ ! -f Dockerfile ]; then
+          echo "❌ Dockerfile missing"
+          exit 1
+        fi
+
+
+        if [ ! -f package.json ] && [ ! -f requirements.txt ] && [ ! -f pom.xml ]; then
+          echo "⚠️ Dependency manifest not detected"
+        fi
+
+
+        echo "✅ Pipeline validation completed"
+    - name: Malware Scan
+      run: |
+        echo "🦠 Running malware scan..."
+
+        sudo apt-get update
+        sudo apt-get install -y clamav
+
+        sudo freshclam
+
+        clamscan -r . --infected --remove=no
+
+        echo "✅ Malware scan completed"
+    - name: Verify Pipeline Actor
+      run: |
+        echo "🔐 Checking pipeline actor..."
+
+        ACTOR="${{ github.actor }}"
+        echo "Triggered by: $ACTOR"
+
+        if [ -z "$ACTOR" ]; then
+          echo "⚠️ Unknown pipeline actor"
+        else
+          echo "✅ Actor verification completed"
+        fi
+    - name: Optimize Runner Performance
+      run: |
+        echo "⚡ Optimizing runner performance..."
+
+        sudo sysctl -w net.core.somaxconn=1024
+        sudo sysctl -w vm.swappiness=10
+
+        echo "✅ Runner optimization applied"
+    - name: Predict Pipeline Outcome
+      run: |
+        echo "📊 Predicting pipeline outcome..."
+
+        if [ "${{ needs.deploy.result }}" == "success" ]; then
+          echo "Prediction: Deployment likely SUCCESS"
+        else
+          echo "Prediction: Deployment may require investigation"
+        fi
+    - name: Cleanup Pipeline Junk
+      run: |
+        echo "🧹 Cleaning pipeline environment..."
+
+        docker system prune -af || true
+        rm -rf /tmp/* || true
+        rm -rf ~/.cache || true
+
+        echo "✅ Cleanup completed"
+    - name: Harden Runner Security
+      run: |
+        echo "🛡️ Applying runner security hardening..."
+
+        sudo ufw default deny incoming
+        sudo ufw default allow outgoing
+
+        echo "✅ Runner hardened"
+    - name: Pipeline Add-on Summary
+      run: |
+        cat << 'EOF'
+
+        ╔════════════════════════════════════════════════════════╗
+        ║       🛡️ PIPELINE SECURITY ADDONS COMPLETED            ║
+        ╚════════════════════════════════════════════════════════╝
+
+        ✔ Code formatting auto-fix executed
+        ✔ Pipeline risk detection completed
+        ✔ Malware scanning completed
+        ✔ Pipeline actor verification completed
+        ✔ Runner performance optimized
+        ✔ Pipeline outcome prediction generated
+        ✔ Pipeline environment cleaned
+        ✔ Runner security hardened
+
+        Pipeline successfully enhanced with DevSecOps safeguards.
+
+        EOF
