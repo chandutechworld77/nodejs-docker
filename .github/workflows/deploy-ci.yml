@@ -1,185 +1,72 @@
-name: faang-devsecops-pipeline
+name: Deploy to Amazon ECS
 
 on:
   push:
     branches:
-      - master
-  workflow_dispatch:
+      - main
 
 env:
-  APP_PORT: 8080
-  ALLOWED_BRANCHES: "master main dev"
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+  ECS_SERVICE: ${{ secrets.ECS_SERVICE }}
+  ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
+  CONTAINER_NAME: ${{ secrets.CONTAINER_NAME }}
 
 jobs:
-
-# ==============================
-# CLEAN WORKSPACE
-# ==============================
-  clean_workspace:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Clean runner workspace
-        run: |
-          echo "Cleaning workspace..."
-          docker system prune -af || true
-          rm -rf *
-# ==============================
-# BRANCH GUARD
-# ==============================
-  guard:
-    runs-on: ubuntu-latest
-    needs: clean_workspace
-
-    steps:
-      - name: Detect branch
-        run: |
-          BRANCH=${GITHUB_REF_NAME}
-          echo "Current branch: $BRANCH"
-          if [[ ! " $ALLOWED_BRANCHES " =~ " $BRANCH " ]]; then
-            echo "Unauthorized branch execution detected"
-            exit 1
-          fi
-# ==============================
-# FORMAT FIX
-# ==============================
-  formatting:
-    runs-on: ubuntu-latest
-    needs: guard
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Fix YAML indentation
-        run: |
-          npm install -g prettier
-          prettier --write "**/*.yml" || true
-# ==============================
-# SECURITY SCAN (DEPENDENCIES)
-# ==============================
-  security_scan:
-    runs-on: ubuntu-latest
-    needs: formatting
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Dependency vulnerability scan
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: fs
-          severity: CRITICAL,HIGH
-
-# ==============================
-# BUILD + LOCAL CONTAINER TEST
-# ==============================
-  build:
-    runs-on: ubuntu-latest
-    needs: security_scan
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build docker image
-        run: docker build -t app-test .
-
-      - name: Run container locally
-        run: |
-          docker run -d -p 8080:8080 --name test-container app-test
-          sleep 15
-      - name: Show running containers
-        run: docker ps -a
-
-      - name: Show container logs
-        run: docker logs test-container || true
-
-      - name: Health check with retry
-        run: |
-          for i in {1..10}; do
-            curl -f http://localhost:8080 && break
-            echo "Waiting for application to start..."
-            sleep 5
-          done
-      - name: Stop container
-        run: |
-          docker stop test-container
-          docker rm test-container
-# SAVE IMAGE FOR NEXT JOB
-      - name: Save docker image
-        run: docker save app-test | gzip > app-test.tar.gz
-
-      - name: Upload image artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: docker-image
-          path: app-test.tar.gz
-
-# ==============================
-# CONTAINER SECURITY SCAN
-# ==============================
-  container_scan:
-    runs-on: ubuntu-latest
-    needs: build
-
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: docker-image
-
-      - name: Load docker image
-        run: |
-          gunzip -c app-test.tar.gz | docker load
-      - name: Scan container image
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: app-test
-          severity: CRITICAL,HIGH
-
-# ==============================
-# COST ANALYSIS
-# ==============================
-  cost_analysis:
-    runs-on: ubuntu-latest
-    needs: container_scan
-
-    steps:
-      - name: Estimate deployment cost
-        run: |
-          echo "Analyzing deployment cost..."
-          echo "Suggestions:"
-          echo "- Reduce replicas if CPU usage <50%"
-          echo "- Enable auto scaling"
-# ==============================
-# DEPLOYMENT PREDICTION
-# ==============================
-  prediction:
-    runs-on: ubuntu-latest
-    needs: cost_analysis
-
-    steps:
-      - name: Predict deployment success
-        run: |
-          echo "Analyzing pipeline results..."
-          echo "Prediction: Deployment likely successful"
-# ==============================
-# DEPLOY
-# ==============================
   deploy:
+    name: Deploy
     runs-on: ubuntu-latest
-    needs: prediction
+    environment: production
 
     steps:
-      - name: Deploy application
-        run: |
-          echo "Deployment stage executed"
-# ==============================
-# FINAL CLEANUP
-# ==============================
-  cleanup:
-    runs-on: ubuntu-latest
-    needs: deploy
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    steps:
-      - name: Cleanup runner resources
+      # ── Configure AWS credentials ──────────────────────────────────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ── Login to Amazon ECR ────────────────────────────────────────────────
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ── Build, tag, and push image to ECR ─────────────────────────────────
+      - name: Build, tag, and push image to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker system prune -af || true
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      # ── Update ECS task definition with new image ──────────────────────────
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition my-task-def \
+            --query taskDefinition \
+            > task-definition.json
+
+      - name: Fill in the new image ID in the task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+
+      # ── Deploy to ECS ──────────────────────────────────────────────────────
+      - name: Deploy Amazon ECS task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
