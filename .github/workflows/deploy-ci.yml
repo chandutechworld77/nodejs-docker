@@ -1,16 +1,12 @@
-# ╔══════════════════════════════════════════════════════════════════════════╗
-# ║          SECURE AWS ECS DEPLOYMENT PIPELINE — GitHub Actions            ║
-# ║  Features: Format Check · Spell Fix · Trivy Scan · Virus Scan ·        ║
-# ║            Credential Leak Detection · Clean Workspace · ECR/ECS Deploy ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
+
 
 name: 🚀 Secure Deploy to Amazon ECS
 
 on:
   push:
-    branches: [main, staging]
+    branches: master
   pull_request:
-    branches: [main]
+    branches: master
 
 # ─── Permissions (OIDC keyless auth) ───────────────────────────────────────────
 permissions:
@@ -34,7 +30,7 @@ env:
 jobs:
   # ─────────────────────────────────────────────────────────────────────────────
   credential-scan:
-    name: 🔐 Credential Leak Detection
+    name: Credential Leak Detection
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -53,7 +49,7 @@ jobs:
 
       # ── TruffleHog: second opinion, scans for verified live credentials ──────
       - name: Run TruffleHog credential scan
-        uses: trufflesecurity/trufflehog@main
+        uses: trufflesecurity/trufflehog@master
         with:
           path: ./
           base: ${{ github.event.repository.default_branch }}
@@ -61,10 +57,10 @@ jobs:
           extra_args: --only-verified   # only alert on live/active credentials
 
       # ── Notify on failure ────────────────────────────────────────────────────
-      - name: 🚨 Alert on credential exposure
+      - name:  Alert on credential exposure
         if: failure()
         run: |
-          echo "::error title=CREDENTIAL LEAK DETECTED::🚨 A secret or credential was detected in the codebase."
+          echo "::error title=CREDENTIAL LEAK DETECTED:: A secret or credential was detected in the codebase."
           echo "::error::Pipeline has been HALTED. Review the Gitleaks/TruffleHog output above."
           echo "::error::Rotate the exposed credential IMMEDIATELY and remove it from git history."
           exit 1
@@ -421,7 +417,7 @@ jobs:
     name: 🚢 Deploy to ECS
     runs-on: ubuntu-latest
     needs: push-to-ecr
-    environment: ${{ github.ref_name == 'main' && 'production' || 'staging' }}
+    environment: ${{ github.ref_name == 'master' && 'production' || 'staging' }}
     steps:
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
