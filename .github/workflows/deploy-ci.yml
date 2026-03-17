@@ -1,5 +1,3 @@
-
-
 name: 🚀 Secure Deploy to Amazon ECS
 
 on:
@@ -8,14 +6,12 @@ on:
   pull_request:
     branches: master
 
-# ─── Permissions (OIDC keyless auth) ───────────────────────────────────────────
 permissions:
-  id-token: write        # Required for OIDC
-  contents: write        # Required to push spell-fix commits
-  security-events: write # Required for uploading SARIF reports
+  id-token: write
+  contents: write
+  security-events: write
   actions: read
 
-# ─── Global env ────────────────────────────────────────────────────────────────
 env:
   AWS_REGION:      ${{ secrets.AWS_REGION }}
   ECR_REPOSITORY:  ${{ secrets.ECR_REPOSITORY }}
@@ -24,11 +20,8 @@ env:
   CONTAINER_NAME:  ${{ secrets.CONTAINER_NAME }}
   TASK_DEFINITION: ${{ secrets.TASK_DEFINITION }}
 
-# ══════════════════════════════════════════════════════════════════════════════
-# JOB 1 ── CREDENTIAL LEAK DETECTION  (RUNS FIRST — blocks everything else)
-# ══════════════════════════════════════════════════════════════════════════════
 jobs:
-  # ─────────────────────────────────────────────────────────────────────────────
+  # ───────────── JOB 1: Credential Leak Detection ─────────────
   credential-scan:
     name: Credential Leak Detection
     runs-on: ubuntu-latest
@@ -36,28 +29,23 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0          # Full history so Gitleaks can scan all commits
+          fetch-depth: 0
 
-      # ── Gitleaks: scans entire git history for secrets ───────────────────────
       - name: Run Gitleaks secret scan
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}   # optional for teams
-        # gitleaks-action automatically exits with code 1 and fails the job
-        # if any secrets are detected — the rest of the pipeline will NOT run.
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
 
-      # ── TruffleHog: second opinion, scans for verified live credentials ──────
       - name: Run TruffleHog credential scan
-        uses: trufflesecurity/trufflehog@master
+        uses: trufflesecurity/trufflehog@v3
         with:
           path: ./
           base: ${{ github.event.repository.default_branch }}
           head: HEAD
-          extra_args: --only-verified   # only alert on live/active credentials
+          extra_args: --only-verified
 
-      # ── Notify on failure ────────────────────────────────────────────────────
-      - name:  Alert on credential exposure
+      - name: Alert on credential exposure
         if: failure()
         run: |
           echo "::error title=CREDENTIAL LEAK DETECTED:: A secret or credential was detected in the codebase."
@@ -65,20 +53,17 @@ jobs:
           echo "::error::Rotate the exposed credential IMMEDIATELY and remove it from git history."
           exit 1
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # JOB 2 ── CODE FORMAT + SPELL CHECK + AUTO-FIX
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ───────────── JOB 2: Format & Spell Check ─────────────
   format-and-spell:
     name: ✏️ Format & Spell Check
     runs-on: ubuntu-latest
-    needs: credential-scan       # Only runs if no credentials were found
+    needs: credential-scan
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── Setup Node (needed for Prettier + cspell) ─────────────────────────────
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -96,78 +81,43 @@ jobs:
             @cspell/dict-docker \
             @cspell/dict-bash
 
-      # ── Prettier: auto-format JS/TS/JSON/YAML/MD/HTML ────────────────────────
       - name: Auto-format code with Prettier
         run: |
-          npx prettier --write \
-            "**/*.{js,ts,jsx,tsx,json,yaml,yml,md,html,css,scss}" \
-            --ignore-path .gitignore \
-            --log-level warn
-        continue-on-error: false
+          npx prettier --write "**/*.{js,ts,jsx,tsx,json,yaml,yml,md,html,css,scss}" \
+            --ignore-path .gitignore --log-level warn
 
-      # ── cspell: find misspellings, auto-correct known typos ──────────────────
       - name: Check & auto-correct spelling
         run: |
-          # Create cspell config if it doesn't exist
           if [ ! -f cspell.json ]; then
             cat > cspell.json << 'EOF'
-          {
-            "version": "0.2",
-            "language": "en",
-            "dictionaries": ["aws", "docker", "bash", "softwareTerms", "typescript"],
-            "words": ["ECS", "ECR", "Fargate", "OIDC", "trivy", "cspell", "gitleaks"],
-            "ignorePaths": [
-              "node_modules/**",
-              "*.lock",
-              "dist/**",
-              ".git/**",
-              "*.min.js"
-            ],
-            "ignoreRegExpList": [
-              "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}",
-              "sha[0-9a-f]{40}"
-            ]
-          }
-          EOF
+            {
+              "version": "0.2",
+              "language": "en",
+              "dictionaries": ["aws","docker","bash","softwareTerms","typescript"],
+              "words": ["ECS","ECR","Fargate","OIDC","trivy","cspell","gitleaks"],
+              "ignorePaths": ["node_modules/**","*.lock","dist/**",".git/**","*.min.js"],
+              "ignoreRegExpList": ["[0-9a-fA-F]{8}-[0-9a-fA-F]{4}","sha[0-9a-f]{40}"]
+            }
+            EOF
           fi
+          npx cspell lint "**/*.{md,txt,js,ts,yaml,yml}" --no-progress --show-suggestions --show-context --reporter @cspell/cspell-pipe-reporter 2>&1 | tee spell-report.txt || true
 
-          # Run spell check — report but don't block (auto-fix below handles it)
-          npx cspell lint "**/*.{md,txt,js,ts,yaml,yml}" \
-            --no-progress \
-            --show-suggestions \
-            --show-context \
-            --reporter @cspell/cspell-pipe-reporter \
-            2>&1 | tee spell-report.txt || true
-
-          echo "Spell check complete. See spell-report.txt for details."
-
-      # ── autocorrect: deterministic typo fixer for common mistakes ────────────
       - name: Install and run autocorrect
         run: |
-          # Install autocorrect (Rust-based, very fast)
-          curl -sSL https://github.com/huacnlee/autocorrect/releases/latest/download/autocorrect-linux-amd64.tar.gz \
-            | tar xz
+          curl -sSL https://github.com/huacnlee/autocorrect/releases/latest/download/autocorrect-linux-amd64.tar.gz | tar xz
           chmod +x autocorrect
           sudo mv autocorrect /usr/local/bin/
+          autocorrect --fix --type markdown,yaml,javascript,typescript,html,css .
 
-          # Auto-fix spacing and common typos in source + docs
-          autocorrect --fix \
-            --type markdown,yaml,javascript,typescript,html,css \
-            . \
-          2>&1 || true
-
-      # ── Commit auto-fixes back to the branch ─────────────────────────────────
       - name: Commit formatting & spelling fixes
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "style: auto-format + spell-fix [skip ci]"
-          commit_user_name:  "github-actions[bot]"
+          commit_user_name: "github-actions[bot]"
           commit_user_email: "github-actions[bot]@users.noreply.github.com"
           file_pattern: "."
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # JOB 3 ── VIRUS SCAN (ClamAV)
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ───────────── JOB 3: Virus Scan ─────────────
   virus-scan:
     name: 🦠 Virus Scan (ClamAV)
     runs-on: ubuntu-latest
@@ -182,25 +132,12 @@ jobs:
           sudo apt-get install -y clamav clamav-daemon
           sudo systemctl stop clamav-freshclam || true
           sudo freshclam --quiet
-          echo "✅ ClamAV virus definitions updated"
 
       - name: Scan repository for malware/viruses
         run: |
-          clamscan \
-            --recursive \
-            --infected \
-            --remove=no \
-            --exclude-dir=".git" \
-            --exclude="*.lock" \
-            --log=clamav-report.txt \
-            . \
+          clamscan --recursive --infected --remove=no --exclude-dir=".git" --exclude="*.lock" --log=clamav-report.txt . \
           && echo "✅ No viruses or malware found" \
-          || (
-            echo "::error title=VIRUS DETECTED::🚨 ClamAV detected malicious files!"
-            echo "::error::See clamav-report.txt for the full report."
-            cat clamav-report.txt
-            exit 1
-          )
+          || (echo "::error title=VIRUS DETECTED::🚨 ClamAV detected malicious files!"; cat clamav-report.txt; exit 1)
 
       - name: Upload ClamAV report
         if: always()
@@ -210,31 +147,28 @@ jobs:
           path: clamav-report.txt
           retention-days: 30
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # JOB 4 ── BUILD DOCKER IMAGE
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ───────────── JOB 4: Build Docker Image ─────────────
   build:
     name: 🐳 Build Docker Image
     runs-on: ubuntu-latest
     needs: [format-and-spell, virus-scan]
     outputs:
-      image-tag:  ${{ steps.meta.outputs.image-tag }}
-      ecr-image:  ${{ steps.build-image.outputs.image }}
+      image-tag: ${{ steps.meta.outputs.image-tag }}
+      ecr-image: ${{ steps.build-image.outputs.image }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials (OIDC — no static keys)
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
-          aws-region:     ${{ env.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # ── Generate image metadata & tags ───────────────────────────────────────
       - name: Generate image metadata
         id: meta
         run: |
@@ -242,9 +176,7 @@ jobs:
           TIMESTAMP=$(date -u +"%Y%m%d%H%M%S")
           IMAGE_TAG="${{ github.ref_name }}-${SHORT_SHA}-${TIMESTAMP}"
           echo "image-tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
-          echo "Generated tag: ${IMAGE_TAG}"
 
-      # ── Build with layer caching ──────────────────────────────────────────────
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -252,7 +184,7 @@ jobs:
         id: build-image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG:    ${{ steps.meta.outputs.image-tag }}
+          IMAGE_TAG: ${{ steps.meta.outputs.image-tag }}
         run: |
           docker buildx build \
             --cache-from type=registry,ref=$ECR_REGISTRY/$ECR_REPOSITORY:cache \
@@ -260,19 +192,14 @@ jobs:
             --platform   linux/amd64 \
             --tag        $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
             --tag        $ECR_REGISTRY/$ECR_REPOSITORY:latest \
-            --load \
-            .
-
+            --load .
           echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
 
-      # ── Save image as tar for scanning ───────────────────────────────────────
       - name: Export image to tar
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG:    ${{ steps.meta.outputs.image-tag }}
-        run: |
-          docker save $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
-            -o /tmp/docker-image.tar
+          IMAGE_TAG: ${{ steps.meta.outputs.image-tag }}
+        run: docker save $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -o /tmp/docker-image.tar
 
       - name: Upload image tar for Trivy job
         uses: actions/upload-artifact@v4
@@ -281,9 +208,7 @@ jobs:
           path: /tmp/docker-image.tar
           retention-days: 1
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # JOB 5 ── TRIVY SECURITY SCAN (3-layer scan: repo + image + SBOM)
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ───────────── JOB 5: Trivy Security Scan ─────────────
   trivy-scan:
     name: 🔍 Trivy Security Scan
     runs-on: ubuntu-latest
@@ -292,26 +217,24 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ── Layer 1: Scan source code repo for CVEs & misconfigurations ──────────
       - name: Trivy — Scan filesystem (repo)
         uses: aquasecurity/trivy-action@master
         with:
-          scan-type:    'fs'
-          scan-ref:     '.'
-          format:       'sarif'
-          output:       'trivy-fs-report.sarif'
-          severity:     'CRITICAL,HIGH'
-          exit-code:    '1'              # Fail on CRITICAL or HIGH findings
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-fs-report.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
           ignore-unfixed: true
 
-      - name: Upload filesystem SARIF to GitHub Security
+      - name: Upload filesystem SARIF
         uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
           sarif_file: trivy-fs-report.sarif
-          category:   trivy-filesystem
+          category: trivy-filesystem
 
-      # ── Layer 2: Scan Docker image for CVEs ──────────────────────────────────
       - name: Download image tar
         uses: actions/download-artifact@v4
         with:
@@ -321,30 +244,29 @@ jobs:
       - name: Trivy — Scan Docker image
         uses: aquasecurity/trivy-action@master
         with:
-          scan-type:    'image'
-          input:        '/tmp/docker-image.tar'
-          format:       'sarif'
-          output:       'trivy-image-report.sarif'
-          severity:     'CRITICAL,HIGH'
-          exit-code:    '1'
+          scan-type: 'image'
+          input: '/tmp/docker-image.tar'
+          format: 'sarif'
+          output: 'trivy-image-report.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
           ignore-unfixed: true
 
-      - name: Upload image SARIF to GitHub Security
+      - name: Upload image SARIF
         uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
           sarif_file: trivy-image-report.sarif
-          category:   trivy-docker-image
+          category: trivy-docker-image
 
-      # ── Layer 3: Generate SBOM (Software Bill of Materials) ──────────────────
       - name: Trivy — Generate SBOM
         uses: aquasecurity/trivy-action@master
         with:
-          scan-type:  'image'
-          input:      '/tmp/docker-image.tar'
-          format:     'cyclonedx'
-          output:     'sbom.cyclonedx.json'
-          exit-code:  '0'               # Don't fail on SBOM generation
+          scan-type: 'image'
+          input: '/tmp/docker-image.tar'
+          format: 'cyclonedx'
+          output: 'sbom.cyclonedx.json'
+          exit-code: '0'
 
       - name: Upload SBOM artifact
         uses: actions/upload-artifact@v4
@@ -354,27 +276,24 @@ jobs:
           path: sbom.cyclonedx.json
           retention-days: 90
 
-      # ── Human-readable table report ───────────────────────────────────────────
       - name: Trivy — Print summary table
         uses: aquasecurity/trivy-action@master
         if: always()
         with:
-          scan-type:    'image'
-          input:        '/tmp/docker-image.tar'
-          format:       'table'
-          exit-code:    '0'
-          severity:     'CRITICAL,HIGH,MEDIUM'
+          scan-type: 'image'
+          input: '/tmp/docker-image.tar'
+          format: 'table'
+          exit-code: '0'
+          severity: 'CRITICAL,HIGH,MEDIUM'
 
-      - name: 🚨 Alert on Trivy findings
+      - name: Alert on Trivy findings
         if: failure()
         run: |
           echo "::error title=TRIVY VULNERABILITIES FOUND::🔴 CRITICAL or HIGH CVEs detected!"
-          echo "::error::Review the Security tab → Code Scanning for full details."
+          echo "::error::Review Security tab → Code Scanning for details."
           echo "::error::Pipeline HALTED — fix vulnerabilities before deploying."
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # JOB 6 ── PUSH TO ECR
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ───────────── JOB 6: Push to ECR ─────────────
   push-to-ecr:
     name: 📦 Push Image to ECR
     runs-on: ubuntu-latest
@@ -386,7 +305,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
-          aws-region:     ${{ env.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
         id: login-ecr
@@ -402,17 +321,14 @@ jobs:
         id: push
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG:    ${{ needs.build.outputs.image-tag }}
+          IMAGE_TAG: ${{ needs.build.outputs.image-tag }}
         run: |
           docker load -i /tmp/docker-image.tar
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
           echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
-          echo "✅ Image pushed: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # JOB 7 ── DEPLOY TO AMAZON ECS
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ───────────── JOB 7: Deploy to ECS ─────────────
   deploy:
     name: 🚢 Deploy to ECS
     runs-on: ubuntu-latest
@@ -423,50 +339,43 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
-          aws-region:     ${{ env.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Download current ECS task definition
         run: |
-          aws ecs describe-task-definition \
-            --task-definition ${{ env.TASK_DEFINITION }} \
-            --query taskDefinition \
-            > task-definition.json
-
-          echo "📋 Current task definition:"
+          aws ecs describe-task-definition --task-definition ${{ env.TASK_DEFINITION }} --query taskDefinition > task-definition.json
           cat task-definition.json | python3 -m json.tool | head -40
 
       - name: Inject new image into task definition
         id: task-def
         uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
-          task-definition:  task-definition.json
-          container-name:   ${{ env.CONTAINER_NAME }}
-          image:            ${{ needs.push-to-ecr.outputs.ecr-image }}
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ needs.push-to-ecr.outputs.ecr-image }}
 
       - name: Deploy to ECS service
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
         with:
-          task-definition:           ${{ steps.task-def.outputs.task-definition }}
-          service:                   ${{ env.ECS_SERVICE }}
-          cluster:                   ${{ env.ECS_CLUSTER }}
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
           wait-for-service-stability: true
-          wait-for-minutes:          10
+          wait-for-minutes: 10
 
-      - name: ✅ Deployment successful
+      - name: Deployment successful
         run: |
           echo "🎉 Successfully deployed to ECS!"
           echo "Image: ${{ needs.push-to-ecr.outputs.ecr-image }}"
           echo "Cluster: ${{ env.ECS_CLUSTER }}"
           echo "Service: ${{ env.ECS_SERVICE }}"
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # JOB 8 ── CLEAN WORKSPACE (always runs — even on failure)
-  # ══════════════════════════════════════════════════════════════════════════════
+  # ───────────── JOB 8: Clean Workspace ─────────────
   clean-workspace:
     name: 🧹 Clean Workspace
     runs-on: ubuntu-latest
     needs: [deploy, trivy-scan, virus-scan]
-    if: always()                        # Run even if previous jobs fail
+    if: always()
     steps:
       - name: Delete Docker image tar artifact
         uses: geekyeggo/delete-artifact@v5
@@ -478,13 +387,11 @@ jobs:
         run: |
           docker system prune -af --volumes 2>/dev/null || true
           docker builder prune -af 2>/dev/null || true
-          echo "✅ Docker cache and dangling images removed"
 
       - name: Clean temp files
         run: |
           rm -rf /tmp/docker-image.tar 2>/dev/null || true
           rm -rf /tmp/*.tar 2>/dev/null || true
-          echo "✅ Temp files cleaned"
 
       - name: Report pipeline summary
         run: |
