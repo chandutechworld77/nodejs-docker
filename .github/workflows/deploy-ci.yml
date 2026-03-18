@@ -1,4 +1,4 @@
-name: 🚀 Secure Deploy to AWS ECS
+name: 🚀 Secure DevSecOps Pipeline (AWS ECS)
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
 
 permissions:
   id-token: write
-  contents: write
+  contents: read
   security-events: write
 
 env:
@@ -24,16 +24,16 @@ jobs:
     steps:
       - name: Clean workspace
         run: |
-          sudo rm -rf $GITHUB_WORKSPACE/*
+          echo "Cleaning workspace..."
+          sudo rm -rf $GITHUB_WORKSPACE/* || true
           docker system prune -af || true
 
 # 🔐 CREDENTIAL SCAN
   credential-scan:
     runs-on: ubuntu-latest
     needs: clean-start
-
     steps:
-      - name: Checkout
+      - name: Checkout Code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -41,9 +41,9 @@ jobs:
       - name: Gitleaks Scan
         uses: gitleaks/gitleaks-action@v2
 
-      - name: TruffleHog Scan
+      - name: TruffleHog Scan (Docker)
         run: |
-          echo "Running TruffleHog..."
+          echo "Running TruffleHog scan..."
           docker run --rm \
             -v ${{ github.workspace }}:/repo \
             ghcr.io/trufflesecurity/trufflehog:latest \
@@ -51,11 +51,10 @@ jobs:
             --only-verified \
             --no-update
 
-# ✏️ FORMAT
+# ✏️ FORMAT CHECK
   format:
     runs-on: ubuntu-latest
     needs: credential-scan
-
     steps:
       - uses: actions/checkout@v4
 
@@ -68,28 +67,33 @@ jobs:
           npm install -g prettier
           npx prettier --write .
 
-# 🦠 VIRUS SCAN
+# 🦠 VIRUS SCAN (FIXED)
   virus-scan:
     runs-on: ubuntu-latest
     needs: credential-scan
-
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run ClamAV
+      - name: Run ClamAV Scan
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y clamav
-          sudo freshclam
-          clamscan -r . --exclude-dir=".git" || exit 1
 
-# 🐳 BUILD
+          echo "Fixing ClamAV..."
+          sudo systemctl stop clamav-freshclam || true
+          sudo rm -f /var/log/clamav/freshclam.log
+
+          sudo freshclam --stdout
+
+          echo "Running scan..."
+          clamscan -r . --exclude-dir=".git" --infected --no-summary || exit 1
+
+# 🐳 BUILD DOCKER IMAGE
   build:
     runs-on: ubuntu-latest
     needs: [format, virus-scan]
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
-
     steps:
       - uses: actions/checkout@v4
 
@@ -99,10 +103,12 @@ jobs:
           role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - id: login
+      - name: Login to ECR
+        id: login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - id: meta
+      - name: Generate Tag
+        id: meta
         run: |
           TAG=${GITHUB_SHA::8}
           echo "tag=$TAG" >> $GITHUB_OUTPUT
@@ -120,30 +126,28 @@ jobs:
           name: image
           path: image.tar
 
-# 🔍 TRIVY
+# 🔍 TRIVY SCAN
   trivy:
     runs-on: ubuntu-latest
     needs: build
-
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: image
 
-      - name: Scan Image
+      - name: Scan Image with Trivy
         uses: aquasecurity/trivy-action@0.20.0
         with:
           input: image.tar
           severity: CRITICAL,HIGH
           exit-code: 1
 
-# 📦 PUSH
+# 📦 PUSH TO ECR
   push:
     runs-on: ubuntu-latest
     needs: trivy
     outputs:
       image: ${{ steps.push.outputs.image }}
-
     steps:
       - name: Configure AWS
         uses: aws-actions/configure-aws-credentials@v4
@@ -151,25 +155,26 @@ jobs:
           role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - id: login
+      - name: Login to ECR
+        id: login
         uses: aws-actions/amazon-ecr-login@v2
 
       - uses: actions/download-artifact@v4
         with:
           name: image
 
-      - id: push
+      - name: Push Image
+        id: push
         run: |
           docker load -i image.tar
           IMAGE=${{ steps.login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.build.outputs.tag }}
           docker push $IMAGE
           echo "image=$IMAGE" >> $GITHUB_OUTPUT
 
-# 🚢 DEPLOY
+# 🚢 DEPLOY TO ECS
   deploy:
     runs-on: ubuntu-latest
     needs: push
-
     steps:
       - name: Configure AWS
         uses: aws-actions/configure-aws-credentials@v4
@@ -177,21 +182,21 @@ jobs:
           role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Deploy ECS
+      - name: Deploy to ECS
         run: |
           aws ecs update-service \
             --cluster ${{ env.ECS_CLUSTER }} \
             --service ${{ env.ECS_SERVICE }} \
             --force-new-deployment
 
-# 🧹 CLEAN END
+# 🧹 CLEANUP END
   cleanup:
     runs-on: ubuntu-latest
     if: always()
     needs: [deploy, trivy, virus-scan]
-
     steps:
       - name: Cleanup
         run: |
           docker system prune -af || true
           rm -f image.tar || true
+          echo "Cleanup completed"
