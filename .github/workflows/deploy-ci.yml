@@ -48,12 +48,16 @@ jobs:
 
       - uses: gitleaks/gitleaks-action@v2
 
-      - name: TruffleHog Scan (Docker)
+- name: TruffleHog Scan (Docker)
   run: |
     echo "Running TruffleHog scan..."
-    docker run --rm -v ${{ github.workspace }}:/repo \
+
+    docker run --rm \
+      -v ${{ github.workspace }}:/repo \
       ghcr.io/trufflesecurity/trufflehog:latest \
-      filesystem /repo --only-verified --no-update
+      filesystem /repo \
+      --only-verified \
+      --no-update
 
 # ═══════════════════════════════════════════════
 # 2. ✏️ Format + Spell Check
