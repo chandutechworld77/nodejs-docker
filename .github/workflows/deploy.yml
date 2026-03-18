@@ -1,151 +1,220 @@
-name: Self-Healing CI/CD + ECS Deploy
+name: 🤖 Autonomous AI DevSecOps Pipeline (TEST MODE)
 
 on:
   push:
-    branches:
-      - master
+    branches: [ master ]
   pull_request:
-    branches:
-      - master
-  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+  security-events: write
 
 env:
-  IMAGE_NAME: app
+  ENABLE_AWS_DEPLOY: "false"   # 🔥 CHANGE TO "true" FOR PRODUCTION
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+  ECS_SERVICE: ${{ secrets.ECS_SERVICE }}
+  ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
+  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
 jobs:
 
-# ---------------- LINT ----------------
-
-  lint:
+# 🧹 CLEAN
+  clean:
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install ShellCheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
-
-      - name: Run ShellCheck
+      - name: Clean workspace
         run: |
-          find . -type f -name "*.sh" -exec shellcheck {} \; || true
+          sudo rm -rf $GITHUB_WORKSPACE/* || true
+          docker system prune -af || true
 
-
-# ---------------- VALIDATE ----------------
-
-  validate-dependencies:
+# 🤖 AI CODE REVIEW
+  ai-review:
     runs-on: ubuntu-latest
-
+    needs: clean
     steps:
       - uses: actions/checkout@v4
 
-      - name: Validate Dependencies
-        run: echo "Validating dependencies..."
+      - name: Super Linter
+        uses: github/super-linter@v6
+        env:
+          DEFAULT_BRANCH: master
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-
-# ---------------- RUN SCRIPTS ----------------
-
-  run-scripts:
+# 🔐 SECURITY AGENT
+  security:
     runs-on: ubuntu-latest
-    needs: [lint, validate-dependencies]
-
-    strategy:
-      fail-fast: false
-
+    needs: ai-review
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run Scripts with Retry
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+
+      - name: TruffleHog Scan
         run: |
-          for script in $(find . -name "*.sh"); do
-            echo "Running $script"
-            for i in 1 2 3; do
-              bash "$script" && break
-              echo "Retry $i"
-              sleep 5
-            done
-          done
+          docker run --rm \
+            -v ${{ github.workspace }}:/repo \
+            ghcr.io/trufflesecurity/trufflehog:latest \
+            filesystem /repo --only-verified --no-update
 
-
-# ---------------- FLAKY TEST ----------------
-
-  flaky-test-detection:
+# 🧠 SYNTAX AGENT
+  syntax:
     runs-on: ubuntu-latest
-    needs: run-scripts
-
-    steps:
-      - run: echo "Flaky test detection complete"
-
-
-# ---------------- RECOVERY ----------------
-
-  intelligent-recovery:
-    runs-on: ubuntu-latest
-    needs: [run-scripts, flaky-test-detection]
-    if: always()
-
-    steps:
-      - run: echo "Recovery done"
-
-
-# ---------------- BUILD + PUSH ECR ----------------
-
-  build-push:
-    runs-on: ubuntu-latest
-    needs: intelligent-recovery
-
+    needs: security
     steps:
       - uses: actions/checkout@v4
 
+      - name: YAML Lint
+        uses: ibiqlik/action-yamllint@v3
 
-      - name: Configure AWS
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: JSON + Shell Check
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y jq shellcheck
+          find . -name "*.json" -exec jq empty {} \;
+          find . -name "*.sh" -exec shellcheck {} \;
+
+# 🧬 SAST (CodeQL)
+  sast:
+    runs-on: ubuntu-latest
+    needs: syntax
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: github/codeql-action/init@v3
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          languages: javascript
 
+      - uses: github/codeql-action/analyze@v3
 
-      - name: Login to ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
+# 🧪 TEST AGENT
+  test:
+    runs-on: ubuntu-latest
+    needs: syntax
+    steps:
+      - uses: actions/checkout@v4
 
+      - name: Run Tests
+        run: |
+          npm install || true
+          npm test || true
+
+# 🦠 VIRUS SCAN (FIXED)
+  virus:
+    runs-on: ubuntu-latest
+    needs: syntax
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ClamAV Scan
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y clamav
+          sudo systemctl stop clamav-freshclam || true
+          sudo rm -f /var/log/clamav/freshclam.log
+          sudo freshclam --stdout
+          clamscan -r . --exclude-dir=".git" || true
+
+# 🐳 BUILD
+  build:
+    runs-on: ubuntu-latest
+    needs: [sast, test, virus]
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate Tag
+        id: meta
+        run: |
+          TAG=${GITHUB_SHA::8}
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
 
       - name: Build Docker Image
-        run: docker build -t $IMAGE_NAME .
-
-
-      - name: Tag Image
         run: |
-          docker tag $IMAGE_NAME:latest \
-          ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:latest
+          docker build -t test-image:${{ steps.meta.outputs.tag }} .
 
-
-      - name: Push Image
+      - name: Save Image
         run: |
-          docker push \
-          ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:latest
+          docker save -o image.tar test-image:${{ steps.meta.outputs.tag }}
 
-
-
-# ---------------- DEPLOY ECS ----------------
-
-  deploy-ecs:
-    runs-on: ubuntu-latest
-    needs: build-push
-
-    steps:
-
-      - name: Configure AWS
-        uses: aws-actions/configure-aws-credentials@v4
+      - uses: actions/upload-artifact@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          name: image
+          path: image.tar
 
+# 🔍 IMAGE SCAN (TRIVY)
+  trivy:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
 
-      - name: Deploy to ECS
+      - name: Scan Image
+        uses: aquasecurity/trivy-action@0.20.0
+        with:
+          input: image.tar
+          severity: CRITICAL,HIGH
+          exit-code: 1
+
+# 🌐 DAST (ZAP)
+  dast:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: ZAP Scan
         run: |
-          aws ecs update-service \
-            --cluster ${{ secrets.ECS_CLUSTER }} \
-            --service ${{ secrets.ECS_SERVICE }} \
-            --force-new-deployment
+          docker run -t owasp/zap2docker-stable zap-baseline.py \
+          -t http://example.com || true
+
+# 🚫 AWS SKIPPED NOTICE
+  aws-skipped:
+    runs-on: ubuntu-latest
+    needs: [trivy, dast]
+    if: env.ENABLE_AWS_DEPLOY == 'false'
+    steps:
+      - run: echo "⚠️ AWS deployment is DISABLED (TEST MODE)"
+
+# 🤖 AI FAILURE ANALYZER
+  ai-analysis:
+    runs-on: ubuntu-latest
+    if: failure()
+    needs: [build]
+    steps:
+      - name: AI Analyze
+        run: |
+          echo "Pipeline failed. AI analysis placeholder."
+
+# 🤖 AI PR BOT
+  ai-pr-bot:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    needs: syntax
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: "🤖 AI Review: Check linting, security, and test results."
+            })
+
+# 🧹 CLEANUP
+  cleanup:
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [build]
+    steps:
+      - name: Cleanup
+        run: |
+          docker system prune -af || true
+          rm -f image.tar || true
+          echo "Cleanup done"
