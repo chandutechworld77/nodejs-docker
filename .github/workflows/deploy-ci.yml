@@ -1,202 +1,222 @@
-name: 🚀 Secure DevSecOps Pipeline (AWS ECS)
+name: dev-deploy (ACA)
 
 on:
   push:
-    branches: [ master ]
+    branches: ["master"]
+  workflow_dispatch:
 
 permissions:
   id-token: write
   contents: read
-  security-events: write
 
-env:
-  AWS_REGION: ${{ secrets.AWS_REGION }}
-  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-  ECS_SERVICE: ${{ secrets.ECS_SERVICE }}
-  ECS_CLUSTER: ${{ secrets.ECS_CLUSTER }}
-  TASK_DEFINITION: ${{ secrets.TASK_DEFINITION }}
+concurrency:
+  group: aca-master-${{ github.repository }}
+  cancel-in-progress: true
 
 jobs:
-
-# 🧹 CLEAN START
-  clean-start:
+  # ============================
+  # BUILD + SCAN + PUSH
+  # ============================
+  build:
     runs-on: ubuntu-latest
+
+    outputs:
+      IMAGE: ${{ steps.img.outputs.IMAGE }}
+      LOGIN_SERVER: ${{ steps.acr.outputs.LOGIN_SERVER }}
+
     steps:
+      # ----------------------------
+      # Clean workspace
+      # ----------------------------
       - name: Clean workspace
         run: |
           echo "Cleaning workspace..."
-          sudo rm -rf $GITHUB_WORKSPACE/* || true
-          docker system prune -af || true
+          rm -rf * .[^.]* || true
 
-# 🔐 CREDENTIAL SCAN
-  credential-scan:
-    runs-on: ubuntu-latest
-    needs: clean-start
-    steps:
-      - name: Checkout Code
+      # ----------------------------
+      # Checkout
+      # ----------------------------
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          clean: true
 
-      - name: Gitleaks Scan
-        uses: gitleaks/gitleaks-action@v2
-
-      - name: TruffleHog Scan (Docker)
-        run: |
-          echo "Running TruffleHog scan..."
-          docker run --rm \
-            -v ${{ github.workspace }}:/repo \
-            ghcr.io/trufflesecurity/trufflehog:latest \
-            filesystem /repo \
-            --only-verified \
-            --no-update
-
-# ✏️ FORMAT CHECK
-  format:
-    runs-on: ubuntu-latest
-    needs: credential-scan
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      # ----------------------------
+      # Azure Login (OIDC)
+      # ----------------------------
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
         with:
-          node-version: 20
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Format Code
-        run: |
-          npm install -g prettier
-          npx prettier --write .
-
-# 🦠 VIRUS SCAN (FIXED)
-  virus-scan:
-    runs-on: ubuntu-latest
-    needs: credential-scan
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Run ClamAV Scan
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y clamav
-
-          echo "Fixing ClamAV..."
-          sudo systemctl stop clamav-freshclam || true
-          sudo rm -f /var/log/clamav/freshclam.log
-
-          sudo freshclam --stdout
-
-          echo "Running scan..."
-          clamscan -r . --exclude-dir=".git" --infected --no-summary || exit 1
-
-# 🐳 BUILD DOCKER IMAGE
-  build:
-    runs-on: ubuntu-latest
-    needs: [format, virus-scan]
-    outputs:
-      tag: ${{ steps.meta.outputs.tag }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Configure AWS
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Login to ECR
-        id: login
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Generate Tag
+      # ----------------------------
+      # Image metadata
+      # ----------------------------
+      - name: Compute image tag
         id: meta
-        run: |
-          TAG=${GITHUB_SHA::8}
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
+        run: echo "TAG=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
 
-      - name: Build Image
+      - name: Get ACR login server
+        id: acr
         run: |
-          docker build -t ${{ steps.login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }} .
+          LOGIN_SERVER=$(az acr show \
+            -g "${{ vars.RG_ENV }}" \
+            -n "${{ vars.ACR_NAME }}" \
+            --query loginServer -o tsv)
+          echo "LOGIN_SERVER=$LOGIN_SERVER" >> $GITHUB_OUTPUT
 
-      - name: Save Image
+      - name: Define image
+        id: img
         run: |
-          docker save -o image.tar ${{ steps.login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
+          echo "IMAGE=${{ steps.acr.outputs.LOGIN_SERVER }}/${{ vars.ACR_REPO }}:${{ steps.meta.outputs.TAG }}" >> $GITHUB_OUTPUT
 
-      - uses: actions/upload-artifact@v4
+      # ----------------------------
+      # ACR Login
+      # ----------------------------
+      - name: ACR Login
+        run: az acr login -n "${{ vars.ACR_NAME }}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ----------------------------
+      # Build image
+      # ----------------------------
+      - name: Build image
+        uses: docker/build-push-action@v6
         with:
-          name: image
-          path: image.tar
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: ${{ steps.img.outputs.IMAGE }}
+          cache-from: type=gha,scope=master
+          cache-to: type=gha,mode=max,scope=master
 
-# 🔍 TRIVY SCAN
-  trivy:
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: image
-
-      - name: Scan Image with Trivy
+      # ----------------------------
+      # Trivy Scan
+      # ----------------------------
+      - name: Trivy Scan Image
         uses: aquasecurity/trivy-action@0.20.0
         with:
-          input: image.tar
+          image-ref: ${{ steps.img.outputs.IMAGE }}
+          scanners: vuln
+          format: table
+          output: trivy-image-report.txt
           severity: CRITICAL,HIGH
+          vuln-type: os,library
+          ignore-unfixed: true
           exit-code: 1
 
-# 📦 PUSH TO ECR
-  push:
-    runs-on: ubuntu-latest
-    needs: trivy
-    outputs:
-      image: ${{ steps.push.outputs.image }}
-    steps:
-      - name: Configure AWS
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Login to ECR
-        id: login
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: image
-
-      - name: Push Image
-        id: push
+      - name: Show Trivy Report
+        if: always()
         run: |
-          docker load -i image.tar
-          IMAGE=${{ steps.login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.build.outputs.tag }}
-          docker push $IMAGE
-          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+          echo "========== TRIVY IMAGE SCAN REPORT =========="
+          cat trivy-image-report.txt || echo "No report"
 
-# 🚢 DEPLOY TO ECS
+      # ----------------------------
+      # Push image
+      # ----------------------------
+      - name: Push image to ACR
+        run: docker push "${{ steps.img.outputs.IMAGE }}"
+
+  # ============================
+  # DEPLOY
+  # ============================
   deploy:
     runs-on: ubuntu-latest
-    needs: push
+    needs: build
+
     steps:
-      - name: Configure AWS
-        uses: aws-actions/configure-aws-credentials@v4
+      # ----------------------------
+      # Azure Login
+      # ----------------------------
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
         with:
-          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Deploy to ECS
+      # ----------------------------
+      # Ensure Container App exists
+      # ----------------------------
+      - name: Ensure Container App exists
         run: |
-          aws ecs update-service \
-            --cluster ${{ env.ECS_CLUSTER }} \
-            --service ${{ env.ECS_SERVICE }} \
-            --force-new-deployment
+          if az containerapp show -g "${{ vars.RG_ENV }}" -n "${{ vars.APP_NAME }}" >/dev/null 2>&1; then
+            echo "Container App exists"
+          else
+            az containerapp create \
+              -g "${{ vars.RG_ENV }}" \
+              -n "${{ vars.APP_NAME }}" \
+              --environment "${{ vars.CAE_ENV }}" \
+              --image mcr.microsoft.com/azuredocs/containerapps-helloworld:latest \
+              --ingress "${{ vars.INGRESS_TYPE }}" \
+              --target-port "${{ vars.APP_PORT }}" \
+              --min-replicas 1 \
+              --max-replicas 2 \
+              --system-assigned
+          fi
 
-# 🧹 CLEANUP END
-  cleanup:
-    runs-on: ubuntu-latest
-    if: always()
-    needs: [deploy, trivy, virus-scan]
-    steps:
-      - name: Cleanup
+      # ----------------------------
+      # Assign AcrPull (if missing)
+      # ----------------------------
+      - name: Ensure AcrPull role
         run: |
-          docker system prune -af || true
-          rm -f image.tar || true
-          echo "Cleanup completed"
+          PRINCIPAL_ID=$(az containerapp show \
+            -g "${{ vars.RG_ENV }}" \
+            -n "${{ vars.APP_NAME }}" \
+            --query identity.principalId -o tsv)
+
+          ACR_ID=$(az acr show \
+            -g "${{ vars.RG_ENV }}" \
+            -n "${{ vars.ACR_NAME }}" \
+            --query id -o tsv)
+
+          COUNT=$(az role assignment list \
+            --assignee "$PRINCIPAL_ID" \
+            --scope "$ACR_ID" \
+            --role AcrPull \
+            --query "length(@)" -o tsv)
+
+          if [ "$COUNT" -eq 0 ]; then
+            az role assignment create \
+              --assignee "$PRINCIPAL_ID" \
+              --role AcrPull \
+              --scope "$ACR_ID"
+          fi
+
+      # ----------------------------
+      # Configure registry
+      # ----------------------------
+      - name: Configure ACR
+        run: |
+          az containerapp registry set \
+            -g "${{ vars.RG_ENV }}" \
+            -n "${{ vars.APP_NAME }}" \
+            --server "${{ needs.build.outputs.LOGIN_SERVER }}" \
+            --identity system
+
+      # ----------------------------
+      # Deploy image
+      # ----------------------------
+      - name: Deploy image
+        run: |
+          az containerapp update \
+            -g "${{ vars.RG_ENV }}" \
+            -n "${{ vars.APP_NAME }}" \
+            --image "${{ needs.build.outputs.IMAGE }}"
+
+      # ----------------------------
+      # Status
+      # ----------------------------
+      - name: Show status
+        run: |
+          az containerapp show \
+            -g "${{ vars.RG_ENV }}" \
+            -n "${{ vars.APP_NAME }}" \
+            --query "{state:properties.provisioningState,fqdn:properties.configuration.ingress.fqdn}" \
+            -o table
