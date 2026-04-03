@@ -19,12 +19,22 @@ jobs:
   # ============================
   build:
     runs-on: ubuntu-latest
+    environment: master   # ✅ IMPORTANT
 
     outputs:
       IMAGE: ${{ steps.img.outputs.IMAGE }}
       LOGIN_SERVER: ${{ steps.acr.outputs.LOGIN_SERVER }}
 
     steps:
+      # ----------------------------
+      # Debug secrets (VERY IMPORTANT)
+      # ----------------------------
+      - name: Debug secrets
+        run: |
+          echo "CLIENT_ID exists? ${{ secrets.AZURE_CLIENT_ID != '' }}"
+          echo "TENANT_ID exists? ${{ secrets.AZURE_TENANT_ID != '' }}"
+          echo "SUB_ID exists? ${{ secrets.AZURE_SUBSCRIPTION_ID != '' }}"
+
       # ----------------------------
       # Clean workspace
       # ----------------------------
@@ -38,9 +48,6 @@ jobs:
       # ----------------------------
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          clean: true
 
       # ----------------------------
       # Azure Login (OIDC)
@@ -93,8 +100,6 @@ jobs:
           push: false
           load: true
           tags: ${{ steps.img.outputs.IMAGE }}
-          cache-from: type=gha,scope=master
-          cache-to: type=gha,mode=max,scope=master
 
       # ----------------------------
       # Push image
@@ -108,6 +113,7 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     needs: build
+    environment: master   # ✅ IMPORTANT
 
     steps:
       # ----------------------------
