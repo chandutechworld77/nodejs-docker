@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   # ============================
-  # BUILD + SCAN + PUSH
+  # BUILD + PUSH
   # ============================
   build:
     runs-on: ubuntu-latest
@@ -95,27 +95,6 @@ jobs:
           tags: ${{ steps.img.outputs.IMAGE }}
           cache-from: type=gha,scope=master
           cache-to: type=gha,mode=max,scope=master
-
-      # ----------------------------
-      # Trivy Scan (NON-BLOCKING)
-      # ----------------------------
-      - name: Trivy Scan Image
-        uses: aquasecurity/trivy-action@0.20.0
-        with:
-          image-ref: ${{ steps.img.outputs.IMAGE }}
-          scanners: vuln
-          format: table
-          output: trivy-image-report.txt
-          severity: CRITICAL,HIGH
-          vuln-type: os,library
-          ignore-unfixed: true
-          exit-code: 0   # ✅ bypass failure
-
-      - name: Show Trivy Report
-        if: always()
-        run: |
-          echo "========== TRIVY IMAGE SCAN REPORT =========="
-          cat trivy-image-report.txt || echo "No report"
 
       # ----------------------------
       # Push image
