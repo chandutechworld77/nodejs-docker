@@ -167,9 +167,7 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # ----------------------------
-      # Ensure Container App exists
-      # ----------------------------
+      # Ensure app exists
       - name: Ensure Container App exists
         run: |
           EXISTS=$(az containerapp show \
@@ -178,7 +176,7 @@ jobs:
             --query "name" -o tsv 2>/dev/null || echo "notfound")
 
           if [ "$EXISTS" = "${{ vars.APP_NAME }}" ]; then
-            echo "Container App already exists ✅"
+            echo "Container App exists ✅"
           else
             echo "Creating Container App..."
             az containerapp create \
@@ -188,84 +186,59 @@ jobs:
               --image mcr.microsoft.com/azuredocs/containerapps-helloworld:latest \
               --ingress "${{ vars.INGRESS_TYPE }}" \
               --target-port "${{ vars.APP_PORT }}" \
+              --system-assigned \
               --min-replicas 1 \
               --max-replicas 2 \
-              --system-assigned \
               --no-wait
           fi
 
-      # ----------------------------
-      # WAIT FOR PROVISIONING (CRITICAL FIX)
-      # ----------------------------
-      - name: Wait for Container App to be ready
+      # Wait for provisioning
+      - name: Wait for Container App
         run: |
-          echo "Waiting for Container App provisioning..."
-
+          echo "Waiting for Container App..."
           for i in {1..30}; do
             STATE=$(az containerapp show \
               -g "${{ vars.RG_ENV }}" \
               -n "${{ vars.APP_NAME }}" \
               --query "properties.provisioningState" -o tsv 2>/dev/null)
 
-            echo "Current state: $STATE"
+            echo "State: $STATE"
 
             if [ "$STATE" = "Succeeded" ]; then
-              echo "Container App is ready ✅"
+              echo "Ready ✅"
               break
             fi
 
             sleep 10
           done
 
-      # ----------------------------
-      # Assign AcrPull Role
-      # ----------------------------
+      # Assign AcrPull role
       - name: Ensure AcrPull role
         run: |
           PRINCIPAL_ID=$(az containerapp show \
             -g "${{ vars.RG_ENV }}" \
             -n "${{ vars.APP_NAME }}" \
-            --query identity.principalId -o tsv 2>/dev/null || echo "")
+            --query identity.principalId -o tsv)
 
-          if [ -z "$PRINCIPAL_ID" ]; then
-            echo "Skipping role assignment (identity not ready)"
-          else
-            ACR_ID=$(az acr show \
-              -g "${{ vars.RG_ENV }}" \
-              -n "${{ vars.ACR_NAME }}" \
-              --query id -o tsv)
-
-            az role assignment create \
-              --assignee "$PRINCIPAL_ID" \
-              --role AcrPull \
-              --scope "$ACR_ID" || true
-          fi
-
-      # ----------------------------
-      # Configure ACR
-      # ----------------------------
-      - name: Configure ACR
-        run: |
-          az containerapp registry set \
+          ACR_ID=$(az acr show \
             -g "${{ vars.RG_ENV }}" \
-            -n "${{ vars.APP_NAME }}" \
-            --server "${{ needs.build.outputs.LOGIN_SERVER }}" \
-            --identity system || true
+            -n "${{ vars.ACR_NAME }}" \
+            --query id -o tsv)
 
-      # ----------------------------
-      # Deploy Image
-      # ----------------------------
+          az role assignment create \
+            --assignee "$PRINCIPAL_ID" \
+            --role AcrPull \
+            --scope "$ACR_ID" || true
+
+      # Deploy image
       - name: Deploy image
         run: |
           az containerapp update \
             -g "${{ vars.RG_ENV }}" \
             -n "${{ vars.APP_NAME }}" \
-            --image "${{ needs.build.outputs.IMAGE }}" \
-            --no-wait
+            --image "${{ needs.build.outputs.IMAGE }}"
 
-      # ----------------------------
-      # Show Status
-      # ----------------------------
+      # Show status
       - name: Show status
         run: |
           az containerapp show \
