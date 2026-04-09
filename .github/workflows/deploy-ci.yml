@@ -81,7 +81,7 @@ jobs:
 
 
 # ============================
-# RECOVERY (ALWAYS RUNS)
+# RECOVERY
 # ============================
   recovery:
     runs-on: ubuntu-latest
@@ -108,33 +108,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Debug secrets (optional but useful)
-      - name: Debug secrets
-        run: |
-          echo "CLIENT_ID exists? ${{ secrets.AZURE_CLIENT_ID != '' }}"
-          echo "TENANT_ID exists? ${{ secrets.AZURE_TENANT_ID != '' }}"
-          echo "SUB_ID exists? ${{ secrets.AZURE_SUBSCRIPTION_ID != '' }}"
-
-      # ----------------------------
-      # Azure Login (OIDC)
-      # ----------------------------
-      - name: Azure Login
+      - name: Azure Login (OIDC)
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # ----------------------------
-      # Image Tag
-      # ----------------------------
       - name: Generate image tag
         id: meta
         run: echo "TAG=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
 
-      # ----------------------------
-      # Get ACR login server
-      # ----------------------------
       - name: Get ACR login server
         id: acr
         run: |
@@ -144,26 +128,17 @@ jobs:
             --query loginServer -o tsv)
           echo "LOGIN_SERVER=$LOGIN_SERVER" >> $GITHUB_OUTPUT
 
-      # ----------------------------
-      # Define Image
-      # ----------------------------
       - name: Define image
         id: image
         run: |
           echo "IMAGE=${{ steps.acr.outputs.LOGIN_SERVER }}/${{ vars.ACR_REPO }}:${{ steps.meta.outputs.TAG }}" >> $GITHUB_OUTPUT
 
-      # ----------------------------
-      # ACR Login
-      # ----------------------------
       - name: ACR Login
         run: az acr login -n "${{ vars.ACR_NAME }}"
 
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # ----------------------------
-      # Build Image
-      # ----------------------------
       - name: Build image
         uses: docker/build-push-action@v6
         with:
@@ -172,9 +147,6 @@ jobs:
           load: true
           tags: ${{ steps.image.outputs.IMAGE }}
 
-      # ----------------------------
-      # Push Image
-      # ----------------------------
       - name: Push image
         run: docker push "${{ steps.image.outputs.IMAGE }}"
 
@@ -188,10 +160,7 @@ jobs:
     environment: master
 
     steps:
-      # ----------------------------
-      # Azure Login
-      # ----------------------------
-      - name: Azure Login
+      - name: Azure Login (OIDC)
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -203,9 +172,15 @@ jobs:
       # ----------------------------
       - name: Ensure Container App exists
         run: |
-          if az containerapp show -g "${{ vars.RG_ENV }}" -n "${{ vars.APP_NAME }}" >/dev/null 2>&1; then
-            echo "Container App exists"
+          EXISTS=$(az containerapp show \
+            -g "${{ vars.RG_ENV }}" \
+            -n "${{ vars.APP_NAME }}" \
+            --query "name" -o tsv 2>/dev/null || echo "notfound")
+
+          if [ "$EXISTS" = "${{ vars.APP_NAME }}" ]; then
+            echo "Container App already exists ✅"
           else
+            echo "Creating Container App..."
             az containerapp create \
               -g "${{ vars.RG_ENV }}" \
               -n "${{ vars.APP_NAME }}" \
@@ -215,7 +190,8 @@ jobs:
               --target-port "${{ vars.APP_PORT }}" \
               --min-replicas 1 \
               --max-replicas 2 \
-              --system-assigned
+              --system-assigned \
+              --no-wait
           fi
 
       # ----------------------------
@@ -226,17 +202,21 @@ jobs:
           PRINCIPAL_ID=$(az containerapp show \
             -g "${{ vars.RG_ENV }}" \
             -n "${{ vars.APP_NAME }}" \
-            --query identity.principalId -o tsv)
+            --query identity.principalId -o tsv 2>/dev/null || echo "")
 
-          ACR_ID=$(az acr show \
-            -g "${{ vars.RG_ENV }}" \
-            -n "${{ vars.ACR_NAME }}" \
-            --query id -o tsv)
+          if [ -z "$PRINCIPAL_ID" ]; then
+            echo "Skipping role assignment (identity not ready)"
+          else
+            ACR_ID=$(az acr show \
+              -g "${{ vars.RG_ENV }}" \
+              -n "${{ vars.ACR_NAME }}" \
+              --query id -o tsv)
 
-          az role assignment create \
-            --assignee "$PRINCIPAL_ID" \
-            --role AcrPull \
-            --scope "$ACR_ID" || true
+            az role assignment create \
+              --assignee "$PRINCIPAL_ID" \
+              --role AcrPull \
+              --scope "$ACR_ID" || true
+          fi
 
       # ----------------------------
       # Configure ACR
@@ -257,7 +237,8 @@ jobs:
           az containerapp update \
             -g "${{ vars.RG_ENV }}" \
             -n "${{ vars.APP_NAME }}" \
-            --image "${{ needs.build.outputs.IMAGE }}"
+            --image "${{ needs.build.outputs.IMAGE }}" \
+            --no-wait
 
       # ----------------------------
       # Show Status
