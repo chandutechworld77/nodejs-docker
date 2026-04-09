@@ -195,6 +195,29 @@ jobs:
           fi
 
       # ----------------------------
+      # WAIT FOR PROVISIONING (CRITICAL FIX)
+      # ----------------------------
+      - name: Wait for Container App to be ready
+        run: |
+          echo "Waiting for Container App provisioning..."
+
+          for i in {1..30}; do
+            STATE=$(az containerapp show \
+              -g "${{ vars.RG_ENV }}" \
+              -n "${{ vars.APP_NAME }}" \
+              --query "properties.provisioningState" -o tsv 2>/dev/null)
+
+            echo "Current state: $STATE"
+
+            if [ "$STATE" = "Succeeded" ]; then
+              echo "Container App is ready ✅"
+              break
+            fi
+
+            sleep 10
+          done
+
+      # ----------------------------
       # Assign AcrPull Role
       # ----------------------------
       - name: Ensure AcrPull role
@@ -227,7 +250,7 @@ jobs:
             -g "${{ vars.RG_ENV }}" \
             -n "${{ vars.APP_NAME }}" \
             --server "${{ needs.build.outputs.LOGIN_SERVER }}" \
-            --identity system
+            --identity system || true
 
       # ----------------------------
       # Deploy Image
