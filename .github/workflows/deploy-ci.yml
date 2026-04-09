@@ -99,6 +99,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     needs: recovery
+    environment: master
 
     outputs:
       IMAGE: ${{ steps.image.outputs.IMAGE }}
