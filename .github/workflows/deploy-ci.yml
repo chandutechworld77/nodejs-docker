@@ -229,20 +229,19 @@ jobs:
             --assignee "$PRINCIPAL_ID" \
             --role AcrPull \
             --scope "$ACR_ID" || true
-
-      # Deploy image
-      - name: Deploy image
+      
+      - name: Deploy image (with retry)
         run: |
-          az containerapp update \
-            -g "${{ vars.RG_ENV }}" \
-            -n "${{ vars.APP_NAME }}" \
-            --image "${{ needs.build.outputs.IMAGE }}"
-
-      # Show status
-      - name: Show status
-        run: |
-          az containerapp show \
-            -g "${{ vars.RG_ENV }}" \
-            -n "${{ vars.APP_NAME }}" \
-            --query "{state:properties.provisioningState,fqdn:properties.configuration.ingress.fqdn}" \
-            -o table
+          echo "Deploying image with retry logic..."
+      
+          for i in {1..10}; do
+            echo "Attempt $i..."
+      
+            az containerapp update \
+              -g "${{ vars.RG_ENV }}" \
+              -n "${{ vars.APP_NAME }}" \
+              --image "${{ needs.build.outputs.IMAGE }}" && break
+      
+            echo "Update failed... retrying in 15s"
+            sleep 15
+          done
