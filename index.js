@@ -1,7 +1,8 @@
 var http = require('http');
 
-//create a server object:
 http.createServer(function (req, res) {
-  res.write('** Hey my app was deployedd :) **'); //write a response to the client
-  res.end(); //end the response
-}).listen(80); //the server object listens on port 80
+  res.writeHead(200, { 'Content-Type': 'text/plain' }); // 🔥 IMPORTANT
+  res.end('App is running ✅');
+}).listen(80, () => {
+  console.log("Server running on port 80");
+});
