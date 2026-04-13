@@ -1,4 +1,4 @@
-name: dev-deploy (ACA)
+name: dev-deploy-llm (ACA + LLM CI/CD)
 
 on:
   push:
@@ -22,14 +22,64 @@ env:
   INGRESS_TYPE: ${{ vars.INGRESS_TYPE }}
   APP_PORT: ${{ vars.APP_PORT }}
 
+  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+  QUALITY_THRESHOLD: 0.7
+
 jobs:
 
-# ============================
+# ==========================
+# LLM VALIDATION + EVALUATION
+# ==========================
+  llm-evaluate:
+    name: LLM Prompt Evaluation
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Validate Prompts
+      run: |
+        echo "Validating prompts..."
+        for file in prompts/*.txt; do
+          if [ ! -s "$file" ]; then
+            echo "❌ Empty prompt file: $file"
+            exit 1
+          fi
+        done
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.10"
+
+    - name: Install Dependencies
+      run: pip install openai numpy
+
+    - name: Run LLM Evaluation
+      id: eval
+      run: |
+        python scripts/evaluate.py > results.txt
+        cat results.txt
+
+        SCORE=$(grep "FINAL_SCORE" results.txt | cut -d '=' -f2)
+        echo "score=$SCORE" >> $GITHUB_OUTPUT
+
+    - name: Quality Gate
+      run: |
+        echo "Score: ${{ steps.eval.outputs.score }}"
+        if (( $(echo "${{ steps.eval.outputs.score }} < $QUALITY_THRESHOLD" | bc -l) )); then
+          echo "❌ LLM Quality check failed"
+          exit 1
+        fi
+
+
+# ==========================
 # BUILD JOB
-# ============================
+# ==========================
   build:
     name: Build & Push Image
     runs-on: ubuntu-latest
+    needs: llm-evaluate
     environment: master
 
     outputs:
@@ -38,27 +88,9 @@ jobs:
 
     steps:
 
-    # Debug secrets
-    - name: Debug Secrets
-      run: |
-        echo "CLIENT_ID: ${AZURE_CLIENT_ID:+SET}"
-        echo "TENANT_ID: ${AZURE_TENANT_ID:+SET}"
-        echo "SUBSCRIPTION_ID: ${AZURE_SUBSCRIPTION_ID:+SET}"
-      env:
-        AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-        AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-        AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-    # Clean workspace
-    - name: Clean Workspace
-      run: |
-        rm -rf * .[^.]* || true
-
-    # Checkout
     - name: Checkout Code
       uses: actions/checkout@v4
 
-    # Azure Login (OIDC)
     - name: Azure Login
       uses: azure/login@v2
       with:
@@ -66,14 +98,12 @@ jobs:
         tenant-id: ${{ secrets.AZURE_TENANT_ID }}
         subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-    # Compute image tag
     - name: Compute Image Tag
       id: tag
       run: |
         TAG=${GITHUB_SHA::7}
         echo "TAG=$TAG" >> $GITHUB_ENV
 
-    # Get ACR login server
     - name: Get ACR Login Server
       id: acr
       run: |
@@ -81,7 +111,6 @@ jobs:
         echo "LOGIN_SERVER=$LOGIN_SERVER" >> $GITHUB_ENV
         echo "LOGIN_SERVER=$LOGIN_SERVER" >> $GITHUB_OUTPUT
 
-    # Define image
     - name: Define Image Name
       id: set-image
       run: |
@@ -89,16 +118,12 @@ jobs:
         echo "IMAGE=$IMAGE" >> $GITHUB_ENV
         echo "IMAGE=$IMAGE" >> $GITHUB_OUTPUT
 
-    # Login to ACR
     - name: ACR Login
-      run: |
-        az acr login --name $ACR_NAME
+      run: az acr login --name $ACR_NAME
 
-    # Setup Docker Buildx
     - name: Setup Buildx
       uses: docker/setup-buildx-action@v3
 
-    # Build Docker image
     - name: Build Docker Image
       run: |
         docker buildx build \
@@ -106,15 +131,13 @@ jobs:
           --load \
           -t $IMAGE .
 
-    # Push Docker image
     - name: Push Docker Image
-      run: |
-        docker push $IMAGE
+      run: docker push $IMAGE
 
 
-# ============================
+# ==========================
 # DEPLOY JOB
-# ============================
+# ==========================
   deploy:
     name: Deploy to ACA
     runs-on: ubuntu-latest
@@ -123,7 +146,6 @@ jobs:
 
     steps:
 
-    # Azure Login
     - name: Azure Login
       uses: azure/login@v2
       with:
@@ -131,7 +153,6 @@ jobs:
         tenant-id: ${{ secrets.AZURE_TENANT_ID }}
         subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-    # Ensure Container App exists
     - name: Ensure Container App
       run: |
         EXISTS=$(az containerapp show \
@@ -140,7 +161,6 @@ jobs:
           --query name -o tsv 2>/dev/null || echo "")
 
         if [ -z "$EXISTS" ]; then
-          echo "Creating Container App..."
           az containerapp create \
             --name $APP_NAME \
             --resource-group $RG_ENV \
@@ -152,11 +172,8 @@ jobs:
             --max-replicas 2 \
             --registry-server ${{ needs.build.outputs.LOGIN_SERVER }} \
             --system-assigned
-        else
-          echo "Container App already exists"
         fi
 
-    # Ensure AcrPull role
     - name: Assign AcrPull Role
       run: |
         PRINCIPAL_ID=$(az containerapp show \
@@ -164,16 +181,13 @@ jobs:
           --resource-group $RG_ENV \
           --query identity.principalId -o tsv)
 
-        ACR_ID=$(az acr show \
-          --name $ACR_NAME \
-          --query id -o tsv)
+        ACR_ID=$(az acr show --name $ACR_NAME --query id -o tsv)
 
         az role assignment create \
           --assignee $PRINCIPAL_ID \
           --role AcrPull \
-          --scope $ACR_ID || echo "Role already assigned"
+          --scope $ACR_ID || echo "Role exists"
 
-    # Configure registry
     - name: Configure Registry
       run: |
         az containerapp registry set \
@@ -182,7 +196,6 @@ jobs:
           --server ${{ needs.build.outputs.LOGIN_SERVER }} \
           --identity system
 
-    # Deploy new image
     - name: Deploy Image
       run: |
         az containerapp update \
@@ -190,8 +203,7 @@ jobs:
           --resource-group $RG_ENV \
           --image ${{ needs.build.outputs.IMAGE }}
 
-    # Show status
-    - name: Show Deployment Status
+    - name: Show Status
       run: |
         az containerapp show \
           --name $APP_NAME \
