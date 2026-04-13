@@ -1,143 +1,200 @@
-#!/bin/bash
+name: dev-deploy (ACA)
 
-set -e
+on:
+  push:
+    branches: ["master"]
+  workflow_dispatch:
 
-# =========================
-# VARIABLES (EDIT THESE)
-# =========================
-RG="<RESOURCE_GROUP>"
-LOCATION="centralindia"
+permissions:
+  id-token: write
+  contents: read
 
-ACR_NAME="<ACR_NAME>"
-ACR_REPO="nodejs-docker"
+concurrency:
+  group: aca-master-${{ github.repository }}
+  cancel-in-progress: true
 
-APP_NAME="nodejs-docker"
-CAE_ENV="<CONTAINER_APP_ENV>"
+env:
+  RG_ENV: ${{ vars.RG_ENV }}
+  ACR_NAME: ${{ vars.ACR_NAME }}
+  ACR_REPO: ${{ vars.ACR_REPO }}
+  APP_NAME: ${{ vars.APP_NAME }}
+  CAE_ENV: ${{ vars.CAE_ENV }}
+  INGRESS_TYPE: ${{ vars.INGRESS_TYPE }}
+  APP_PORT: ${{ vars.APP_PORT }}
 
-IMAGE_TAG=$(git rev-parse --short HEAD)
-IMAGE=""
+jobs:
 
-echo "Using IMAGE TAG: $IMAGE_TAG"
+# ============================
+# BUILD JOB
+# ============================
+  build:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    environment: master
 
-# =========================
-# LOGIN CHECK
-# =========================
-az account show > /dev/null || az login
+    outputs:
+      IMAGE: ${{ steps.set-image.outputs.IMAGE }}
+      LOGIN_SERVER: ${{ steps.acr.outputs.LOGIN_SERVER }}
 
-# =========================
-# GET ACR LOGIN SERVER
-# =========================
-LOGIN_SERVER=$(az acr show --name $ACR_NAME --query loginServer -o tsv)
-IMAGE="$LOGIN_SERVER/$ACR_REPO:$IMAGE_TAG"
+    steps:
 
-echo "IMAGE = $IMAGE"
+    # Debug secrets
+    - name: Debug Secrets
+      run: |
+        echo "CLIENT_ID: ${AZURE_CLIENT_ID:+SET}"
+        echo "TENANT_ID: ${AZURE_TENANT_ID:+SET}"
+        echo "SUBSCRIPTION_ID: ${AZURE_SUBSCRIPTION_ID:+SET}"
+      env:
+        AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+        AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+        AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-# =========================
-# CREATE CONTAINER APP ENV (if not exists)
-# =========================
-echo "Checking Container App Environment..."
+    # Clean workspace
+    - name: Clean Workspace
+      run: |
+        rm -rf * .[^.]* || true
 
-az containerapp env show \
-  --name $CAE_ENV \
-  --resource-group $RG >/dev/null 2>&1 || \
-az containerapp env create \
-  --name $CAE_ENV \
-  --resource-group $RG \
-  --location $LOCATION
+    # Checkout
+    - name: Checkout Code
+      uses: actions/checkout@v4
 
-# =========================
-# CREATE CONTAINER APP (if not exists)
-# =========================
-echo "Checking Container App..."
+    # Azure Login (OIDC)
+    - name: Azure Login
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-APP_EXISTS=$(az containerapp show \
-  --name $APP_NAME \
-  --resource-group $RG \
-  --query name -o tsv 2>/dev/null || echo "")
+    # Compute image tag
+    - name: Compute Image Tag
+      id: tag
+      run: |
+        TAG=${GITHUB_SHA::7}
+        echo "TAG=$TAG" >> $GITHUB_ENV
 
-if [ -z "$APP_EXISTS" ]; then
-  echo "Creating Container App..."
+    # Get ACR login server
+    - name: Get ACR Login Server
+      id: acr
+      run: |
+        LOGIN_SERVER=$(az acr show --name $ACR_NAME --query loginServer -o tsv)
+        echo "LOGIN_SERVER=$LOGIN_SERVER" >> $GITHUB_ENV
+        echo "LOGIN_SERVER=$LOGIN_SERVER" >> $GITHUB_OUTPUT
 
-  az containerapp create \
-    --name $APP_NAME \
-    --resource-group $RG \
-    --environment $CAE_ENV \
-    --image mcr.microsoft.com/azuredocs/containerapps-helloworld:latest \
-    --target-port 3000 \
-    --ingress external \
-    --min-replicas 1 \
-    --max-replicas 2 \
-    --system-assigned
-else
-  echo "Container App already exists"
-fi
+    # Define image
+    - name: Define Image Name
+      id: set-image
+      run: |
+        IMAGE=$LOGIN_SERVER/$ACR_REPO:$TAG
+        echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+        echo "IMAGE=$IMAGE" >> $GITHUB_OUTPUT
 
-# =========================
-# GET MANAGED IDENTITY
-# =========================
-PRINCIPAL_ID=$(az containerapp show \
-  --name $APP_NAME \
-  --resource-group $RG \
-  --query identity.principalId -o tsv)
+    # Login to ACR
+    - name: ACR Login
+      run: |
+        az acr login --name $ACR_NAME
 
-echo "PRINCIPAL_ID = $PRINCIPAL_ID"
+    # Setup Docker Buildx
+    - name: Setup Buildx
+      uses: docker/setup-buildx-action@v3
 
-# =========================
-# ASSIGN ACR ROLE
-# =========================
-echo "Assigning AcrPull role..."
+    # Build Docker image
+    - name: Build Docker Image
+      run: |
+        docker buildx build \
+          --platform linux/amd64 \
+          --load \
+          -t $IMAGE .
 
-ACR_ID=$(az acr show --name $ACR_NAME --query id -o tsv)
+    # Push Docker image
+    - name: Push Docker Image
+      run: |
+        docker push $IMAGE
 
-az role assignment create \
-  --assignee $PRINCIPAL_ID \
-  --role AcrPull \
-  --scope $ACR_ID 2>/dev/null || echo "Role already exists"
 
-# =========================
-# WAIT FOR RBAC
-# =========================
-echo "Waiting for RBAC propagation..."
-sleep 120
+# ============================
+# DEPLOY JOB
+# ============================
+  deploy:
+    name: Deploy to ACA
+    runs-on: ubuntu-latest
+    needs: build
+    environment: master
 
-# =========================
-# CONFIGURE REGISTRY
-# =========================
-echo "Configuring Container App registry..."
+    steps:
 
-az containerapp registry set \
-  --name $APP_NAME \
-  --resource-group $RG \
-  --server $LOGIN_SERVER \
-  --identity system
+    # Azure Login
+    - name: Azure Login
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-# =========================
-# BUILD & PUSH IMAGE
-# =========================
-echo "Building & pushing image..."
+    # Ensure Container App exists
+    - name: Ensure Container App
+      run: |
+        EXISTS=$(az containerapp show \
+          --name $APP_NAME \
+          --resource-group $RG_ENV \
+          --query name -o tsv 2>/dev/null || echo "")
 
-az acr login --name $ACR_NAME
+        if [ -z "$EXISTS" ]; then
+          echo "Creating Container App..."
+          az containerapp create \
+            --name $APP_NAME \
+            --resource-group $RG_ENV \
+            --environment $CAE_ENV \
+            --image mcr.microsoft.com/azuredocs/containerapps-helloworld:latest \
+            --target-port $APP_PORT \
+            --ingress $INGRESS_TYPE \
+            --min-replicas 1 \
+            --max-replicas 2 \
+            --registry-server ${{ needs.build.outputs.LOGIN_SERVER }} \
+            --system-assigned
+        else
+          echo "Container App already exists"
+        fi
 
-docker build -t $IMAGE .
-docker push $IMAGE
+    # Ensure AcrPull role
+    - name: Assign AcrPull Role
+      run: |
+        PRINCIPAL_ID=$(az containerapp show \
+          --name $APP_NAME \
+          --resource-group $RG_ENV \
+          --query identity.principalId -o tsv)
 
-# =========================
-# DEPLOY IMAGE
-# =========================
-echo "Deploying image..."
+        ACR_ID=$(az acr show \
+          --name $ACR_NAME \
+          --query id -o tsv)
 
-az containerapp update \
-  --name $APP_NAME \
-  --resource-group $RG \
-  --image $IMAGE
+        az role assignment create \
+          --assignee $PRINCIPAL_ID \
+          --role AcrPull \
+          --scope $ACR_ID || echo "Role already assigned"
 
-# =========================
-# SHOW STATUS
-# =========================
-echo "Deployment Status:"
+    # Configure registry
+    - name: Configure Registry
+      run: |
+        az containerapp registry set \
+          --name $APP_NAME \
+          --resource-group $RG_ENV \
+          --server ${{ needs.build.outputs.LOGIN_SERVER }} \
+          --identity system
 
-az containerapp show \
-  --name $APP_NAME \
-  --resource-group $RG \
-  --query "{state:properties.provisioningState,fqdn:properties.configuration.ingress.fqdn}" \
-  -o table
+    # Deploy new image
+    - name: Deploy Image
+      run: |
+        az containerapp update \
+          --name $APP_NAME \
+          --resource-group $RG_ENV \
+          --image ${{ needs.build.outputs.IMAGE }}
+
+    # Show status
+    - name: Show Deployment Status
+      run: |
+        az containerapp show \
+          --name $APP_NAME \
+          --resource-group $RG_ENV \
+          --query "{state:properties.provisioningState,fqdn:properties.configuration.ingress.fqdn}" \
+          -o table
