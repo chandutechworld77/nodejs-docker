@@ -1,4 +1,4 @@
-name: Self-Healing CI/CD + ACA Deploy (OIDC)
+name: dev-deploy (ACA)
 
 on:
   push:
@@ -14,234 +14,187 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE_NAME: app
+  RG_ENV: ${{ vars.RG_ENV }}
+  ACR_NAME: ${{ vars.ACR_NAME }}
+  ACR_REPO: ${{ vars.ACR_REPO }}
+  APP_NAME: ${{ vars.APP_NAME }}
+  CAE_ENV: ${{ vars.CAE_ENV }}
+  INGRESS_TYPE: ${{ vars.INGRESS_TYPE }}
+  APP_PORT: ${{ vars.APP_PORT }}
 
 jobs:
 
 # ============================
-# CLEAN + CHECKOUT
-# ============================
-  setup:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Clean workspace
-        run: |
-          echo "Cleaning workspace..."
-          rm -rf * .[^.]* || true
-
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-
-# ============================
-# LINT + VALIDATION
-# ============================
-  lint-validate:
-    runs-on: ubuntu-latest
-    needs: setup
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install ShellCheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
-
-      - name: Run ShellCheck
-        run: |
-          find . -type f -name "*.sh" -exec shellcheck {} \; || true
-
-      - name: Validate Dependencies
-        run: echo "Validating dependencies..."
-
-
-# ============================
-# RUN SCRIPTS WITH RETRY
-# ============================
-  run-scripts:
-    runs-on: ubuntu-latest
-    needs: lint-validate
-
-    strategy:
-      fail-fast: false
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Run Scripts with Retry
-        run: |
-          for script in $(find . -name "*.sh"); do
-            echo "Running $script"
-            for i in 1 2 3; do
-              bash "$script" && break
-              echo "Retry $i for $script"
-              sleep 5
-            done
-          done
-
-
-# ============================
-# RECOVERY
-# ============================
-  recovery:
-    runs-on: ubuntu-latest
-    needs: run-scripts
-    if: always()
-
-    steps:
-      - name: Recovery step
-        run: echo "Recovery completed"
-
-
-# ============================
-# BUILD + PUSH TO ACR
+# BUILD JOB
 # ============================
   build:
+    name: Build & Push Image
     runs-on: ubuntu-latest
-    needs: recovery
     environment: master
 
     outputs:
-      IMAGE: ${{ steps.image.outputs.IMAGE }}
+      IMAGE: ${{ steps.set-image.outputs.IMAGE }}
       LOGIN_SERVER: ${{ steps.acr.outputs.LOGIN_SERVER }}
 
     steps:
-      - uses: actions/checkout@v4
 
-      - name: Azure Login (OIDC)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+    # Debug secrets
+    - name: Debug Secrets
+      run: |
+        echo "CLIENT_ID: ${AZURE_CLIENT_ID:+SET}"
+        echo "TENANT_ID: ${AZURE_TENANT_ID:+SET}"
+        echo "SUBSCRIPTION_ID: ${AZURE_SUBSCRIPTION_ID:+SET}"
+      env:
+        AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+        AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+        AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Generate image tag
-        id: meta
-        run: echo "TAG=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+    # Clean workspace
+    - name: Clean Workspace
+      run: |
+        rm -rf * .[^.]* || true
 
-      - name: Get ACR login server
-        id: acr
-        run: |
-          LOGIN_SERVER=$(az acr show \
-            -g "${{ vars.RG_ENV }}" \
-            -n "${{ vars.ACR_NAME }}" \
-            --query loginServer -o tsv)
-          echo "LOGIN_SERVER=$LOGIN_SERVER" >> $GITHUB_OUTPUT
+    # Checkout
+    - name: Checkout Code
+      uses: actions/checkout@v4
 
-      - name: Define image
-        id: image
-        run: |
-          echo "IMAGE=${{ steps.acr.outputs.LOGIN_SERVER }}/${{ vars.ACR_REPO }}:${{ steps.meta.outputs.TAG }}" >> $GITHUB_OUTPUT
+    # Azure Login (OIDC)
+    - name: Azure Login
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: ACR Login
-        run: az acr login -n "${{ vars.ACR_NAME }}"
+    # Compute image tag
+    - name: Compute Image Tag
+      id: tag
+      run: |
+        TAG=${GITHUB_SHA::7}
+        echo "TAG=$TAG" >> $GITHUB_ENV
 
-      - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@v3
+    # Get ACR login server
+    - name: Get ACR Login Server
+      id: acr
+      run: |
+        LOGIN_SERVER=$(az acr show --name $ACR_NAME --query loginServer -o tsv)
+        echo "LOGIN_SERVER=$LOGIN_SERVER" >> $GITHUB_ENV
+        echo "LOGIN_SERVER=$LOGIN_SERVER" >> $GITHUB_OUTPUT
 
-      - name: Build image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: false
-          load: true
-          tags: ${{ steps.image.outputs.IMAGE }}
+    # Define image
+    - name: Define Image Name
+      id: set-image
+      run: |
+        IMAGE=$LOGIN_SERVER/$ACR_REPO:$TAG
+        echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+        echo "IMAGE=$IMAGE" >> $GITHUB_OUTPUT
 
-      - name: Push image
-        run: docker push "${{ steps.image.outputs.IMAGE }}"
+    # Login to ACR
+    - name: ACR Login
+      run: |
+        az acr login --name $ACR_NAME
+
+    # Setup Docker Buildx
+    - name: Setup Buildx
+      uses: docker/setup-buildx-action@v3
+
+    # Build Docker image
+    - name: Build Docker Image
+      run: |
+        docker buildx build \
+          --platform linux/amd64 \
+          --load \
+          -t $IMAGE .
+
+    # Push Docker image
+    - name: Push Docker Image
+      run: |
+        docker push $IMAGE
 
 
 # ============================
-# DEPLOY TO AZURE CONTAINER APPS
+# DEPLOY JOB
 # ============================
   deploy:
+    name: Deploy to ACA
     runs-on: ubuntu-latest
     needs: build
     environment: master
 
     steps:
-      - name: Azure Login (OIDC)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # Ensure app exists
-      - name: Ensure Container App exists
-        run: |
-          EXISTS=$(az containerapp show \
-            -g "${{ vars.RG_ENV }}" \
-            -n "${{ vars.APP_NAME }}" \
-            --query "name" -o tsv 2>/dev/null || echo "notfound")
+    # Azure Login
+    - name: Azure Login
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-          if [ "$EXISTS" = "${{ vars.APP_NAME }}" ]; then
-            echo "Container App exists ✅"
-          else
-            echo "Creating Container App..."
-            az containerapp create \
-              -g "${{ vars.RG_ENV }}" \
-              -n "${{ vars.APP_NAME }}" \
-              --environment "${{ vars.CAE_ENV }}" \
-              --image mcr.microsoft.com/azuredocs/containerapps-helloworld:latest \
-              --ingress "${{ vars.INGRESS_TYPE }}" \
-              --target-port "${{ vars.APP_PORT }}" \
-              --system-assigned \
-              --min-replicas 1 \
-              --max-replicas 2 \
-              --no-wait
-          fi
+    # Ensure Container App exists
+    - name: Ensure Container App
+      run: |
+        EXISTS=$(az containerapp show \
+          --name $APP_NAME \
+          --resource-group $RG_ENV \
+          --query name -o tsv 2>/dev/null || echo "")
 
-      # Wait for provisioning
-      - name: Wait for Container App
-        run: |
-          echo "Waiting for Container App..."
-          for i in {1..30}; do
-            STATE=$(az containerapp show \
-              -g "${{ vars.RG_ENV }}" \
-              -n "${{ vars.APP_NAME }}" \
-              --query "properties.provisioningState" -o tsv 2>/dev/null)
+        if [ -z "$EXISTS" ]; then
+          echo "Creating Container App..."
+          az containerapp create \
+            --name $APP_NAME \
+            --resource-group $RG_ENV \
+            --environment $CAE_ENV \
+            --image mcr.microsoft.com/azuredocs/containerapps-helloworld:latest \
+            --target-port $APP_PORT \
+            --ingress $INGRESS_TYPE \
+            --min-replicas 1 \
+            --max-replicas 2 \
+            --registry-server ${{ needs.build.outputs.LOGIN_SERVER }} \
+            --system-assigned
+        else
+          echo "Container App already exists"
+        fi
 
-            echo "State: $STATE"
+    # Ensure AcrPull role
+    - name: Assign AcrPull Role
+      run: |
+        PRINCIPAL_ID=$(az containerapp show \
+          --name $APP_NAME \
+          --resource-group $RG_ENV \
+          --query identity.principalId -o tsv)
 
-            if [ "$STATE" = "Succeeded" ]; then
-              echo "Ready ✅"
-              break
-            fi
+        ACR_ID=$(az acr show \
+          --name $ACR_NAME \
+          --query id -o tsv)
 
-            sleep 10
-          done
+        az role assignment create \
+          --assignee $PRINCIPAL_ID \
+          --role AcrPull \
+          --scope $ACR_ID || echo "Role already assigned"
 
-      # Assign AcrPull role
-      - name: Ensure AcrPull role
-        run: |
-          PRINCIPAL_ID=$(az containerapp show \
-            -g "${{ vars.RG_ENV }}" \
-            -n "${{ vars.APP_NAME }}" \
-            --query identity.principalId -o tsv)
+    # Configure registry
+    - name: Configure Registry
+      run: |
+        az containerapp registry set \
+          --name $APP_NAME \
+          --resource-group $RG_ENV \
+          --server ${{ needs.build.outputs.LOGIN_SERVER }} \
+          --identity system
 
-          ACR_ID=$(az acr show \
-            -g "${{ vars.RG_ENV }}" \
-            -n "${{ vars.ACR_NAME }}" \
-            --query id -o tsv)
+    # Deploy new image
+    - name: Deploy Image
+      run: |
+        az containerapp update \
+          --name $APP_NAME \
+          --resource-group $RG_ENV \
+          --image ${{ needs.build.outputs.IMAGE }}
 
-          az role assignment create \
-            --assignee "$PRINCIPAL_ID" \
-            --role AcrPull \
-            --scope "$ACR_ID" || true
-      
-      - name: Deploy image (with retry)
-        run: |
-          echo "Deploying image with retry logic..."
-      
-          for i in {1..10}; do
-            echo "Attempt $i..."
-      
-            az containerapp update \
-              -g "${{ vars.RG_ENV }}" \
-              -n "${{ vars.APP_NAME }}" \
-              --image "${{ needs.build.outputs.IMAGE }}" && break
-      
-            echo "Update failed... retrying in 15s"
-            sleep 15
-          done
+    # Show status
+    - name: Show Deployment Status
+      run: |
+        az containerapp show \
+          --name $APP_NAME \
+          --resource-group $RG_ENV \
+          --query "{state:properties.provisioningState,fqdn:properties.configuration.ingress.fqdn}" \
+          -o table
