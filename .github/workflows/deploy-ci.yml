@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - master
-
   workflow_dispatch:
 
 permissions:
@@ -22,74 +21,56 @@ env:
 
   TASK_DEFINITION_FILE: .aws/task-definition.json
 
-  CONTAINER_NAME: backend-api
+  CONTAINER_NAME: ${{ vars.CONTAINER_NAME }}
 
 jobs:
   deploy:
-    name: Deploy NodeJS App to ECS Fargate
+    name: Deploy to ECS Fargate
     runs-on: ubuntu-latest
     environment: master
 
     steps:
 
-      # ==========================================
-      # Checkout Repository
-      # ==========================================
+      # ✅ Checkout
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # ==========================================
-      # Configure AWS Credentials
-      # ==========================================
+      # ✅ AWS Login (OIDC)
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # ==========================================
-      # Login to Amazon ECR
-      # ==========================================
+      # ✅ Login to ECR
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # ==========================================
-      # Generate Image Tag
-      # ==========================================
+      # ✅ Generate Image Tag
       - name: Generate Image Tag
         run: |
           echo "IMAGE_TAG=${GITHUB_SHA}" >> $GITHUB_ENV
 
-      # ==========================================
-      # Build Docker Image
-      # ==========================================
+      # ✅ Build Docker Image
       - name: Build Docker Image
         run: |
-          docker build \
-            -t $ECR_REPOSITORY:$IMAGE_TAG \
-            .
+          docker build -t $ECR_REPOSITORY:$IMAGE_TAG .
 
-      # ==========================================
-      # Tag Docker Image
-      # ==========================================
+      # ✅ Tag Docker Image
       - name: Tag Docker Image
         run: |
           docker tag \
-            $ECR_REPOSITORY:$IMAGE_TAG \
-            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$IMAGE_TAG
+          $ECR_REPOSITORY:$IMAGE_TAG \
+          $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$IMAGE_TAG
 
-      # ==========================================
-      # Push Docker Image to Amazon ECR
-      # ==========================================
-      - name: Push Docker Image to Amazon ECR
+      # ✅ Push Docker Image
+      - name: Push Docker Image to ECR
         run: |
           docker push \
-            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$IMAGE_TAG
+          $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$IMAGE_TAG
 
-      # ==========================================
-      # Render ECS Task Definition
-      # ==========================================
+      # ✅ Update Task Definition with New Image
       - name: Render ECS Task Definition
         id: render-task-definition
         uses: aws-actions/amazon-ecs-render-task-definition@v1
@@ -98,9 +79,7 @@ jobs:
           container-name: ${{ env.CONTAINER_NAME }}
           image: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
 
-      # ==========================================
-      # Deploy ECS Task Definition
-      # ==========================================
+      # ✅ Deploy to ECS
       - name: Deploy to Amazon ECS
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
