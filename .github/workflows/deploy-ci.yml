@@ -1,9 +1,9 @@
-
 name: deploy-nodejs-ecs-fargate
 
 on:
   push:
-    branches: [master]
+    branches:
+      - master
 
   workflow_dispatch:
 
@@ -22,18 +22,17 @@ env:
 
   TASK_DEFINITION_FILE: .aws/task-definition.json
 
-  CONTAINER_NAME: node-app
+  CONTAINER_NAME: backend-api
 
 jobs:
   deploy:
     name: Deploy NodeJS App to ECS Fargate
     runs-on: ubuntu-latest
-    environment: master
 
     steps:
 
       # ==========================================
-      # Checkout Source Code
+      # Checkout Repository
       # ==========================================
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -80,7 +79,7 @@ jobs:
             $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$IMAGE_TAG
 
       # ==========================================
-      # Push Docker Image to ECR
+      # Push Docker Image to Amazon ECR
       # ==========================================
       - name: Push Docker Image to Amazon ECR
         run: |
