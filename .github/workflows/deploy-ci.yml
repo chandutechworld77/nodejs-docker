@@ -1,48 +1,110 @@
-name: deploy-ecs-master
+
+name: deploy-nodejs-ecs-fargate
 
 on:
   push:
-    branches: ["master"]
+    branches: [master]
+
   workflow_dispatch:
 
 permissions:
   id-token: write
   contents: read
 
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+
+  ECR_REPOSITORY: ${{ vars.ECR_REPO }}
+
+  ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+  ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+
+  TASK_DEFINITION_FILE: .aws/task-definition.json
+
+  CONTAINER_NAME: node-app
+
 jobs:
   deploy:
+    name: Deploy NodeJS App to ECS Fargate
     runs-on: ubuntu-latest
     environment: master
 
     steps:
-      - uses: actions/checkout@v4
 
-      - name: Configure AWS
+      # ==========================================
+      # Checkout Source Code
+      # ==========================================
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # ==========================================
+      # Configure AWS Credentials
+      # ==========================================
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Login to ECR
+      # ==========================================
+      # Login to Amazon ECR
+      # ==========================================
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ==========================================
+      # Generate Image Tag
+      # ==========================================
+      - name: Generate Image Tag
         run: |
-          aws ecr get-login-password --region ${{ secrets.AWS_REGION }} \
-          | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+          echo "IMAGE_TAG=${GITHUB_SHA}" >> $GITHUB_ENV
 
-      - name: Build Image
-        run: docker build -t ${{ vars.ECR_REPO }} .
-
-      - name: Tag Image
+      # ==========================================
+      # Build Docker Image
+      # ==========================================
+      - name: Build Docker Image
         run: |
-          docker tag ${{ vars.ECR_REPO }}:latest \
-          ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ vars.ECR_REPO }}:latest
+          docker build \
+            -t $ECR_REPOSITORY:$IMAGE_TAG \
+            .
 
-      - name: Push Image
+      # ==========================================
+      # Tag Docker Image
+      # ==========================================
+      - name: Tag Docker Image
         run: |
-          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ vars.ECR_REPO }}:latest
+          docker tag \
+            $ECR_REPOSITORY:$IMAGE_TAG \
+            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$IMAGE_TAG
 
-      - name: Deploy to ECS
+      # ==========================================
+      # Push Docker Image to ECR
+      # ==========================================
+      - name: Push Docker Image to Amazon ECR
         run: |
-          aws ecs update-service \
-          --cluster ${{ vars.ECS_CLUSTER }} \
-          --service ${{ vars.ECS_SERVICE }} \
-          --force-new-deployment
+          docker push \
+            $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$IMAGE_TAG
+
+      # ==========================================
+      # Render ECS Task Definition
+      # ==========================================
+      - name: Render ECS Task Definition
+        id: render-task-definition
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ env.TASK_DEFINITION_FILE }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+
+      # ==========================================
+      # Deploy ECS Task Definition
+      # ==========================================
+      - name: Deploy to Amazon ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-task-definition.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
