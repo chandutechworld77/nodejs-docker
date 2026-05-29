@@ -28,6 +28,7 @@ jobs:
   deploy:
     name: Deploy NodeJS App to ECS Fargate
     runs-on: ubuntu-latest
+    environment: master
 
     steps:
 
